@@ -1,7 +1,7 @@
 import asyncio
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .buhler_config import BUHLER_MACHINES
 from .buhler_registry import BuhlerRegistry
@@ -10,13 +10,13 @@ from .registry import MachineRegistry
 
 
 class UnifiedMachineInfo(BaseModel):
-    machine_id: str
-    name: str
-    protocol: str  # "step7" | "opcua"
-    ip: str | None = None
-    rack: int | None = None
-    slot: int | None = None
-    url: str | None = None
+    machine_id: str = Field(description="Identificatore univoco della macchina")
+    name: str = Field(description="Nome descrittivo della macchina")
+    protocol: str = Field(description="Protocollo di comunicazione: 'step7' (snap7) oppure 'opcua' (Buhler BMMC)")
+    ip: str | None = Field(default=None, description="Indirizzo IP del PLC (solo Step7)")
+    rack: int | None = Field(default=None, description="Numero rack del PLC (solo Step7)")
+    slot: int | None = Field(default=None, description="Numero slot del PLC (solo Step7)")
+    url: str | None = Field(default=None, description="URL del server OPC-UA (solo Buhler, es. opc.tcp://...)")
 
 
 class UnifiedRegistry:

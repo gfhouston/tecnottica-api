@@ -7,18 +7,18 @@ import time
 from typing import Any
 
 from fastapi import HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class LoginRequest(BaseModel):
-    username: str
-    password: str
+    username: str = Field(description="Nome utente")
+    password: str = Field(description="Password in chiaro")
 
 
 class LocalTokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-    expires_in: int
+    access_token: str = Field(description="Bearer token da usare nell'header Authorization")
+    token_type: str = Field(default="bearer", description="Tipo di token (sempre 'bearer')")
+    expires_in: int = Field(description="Durata del token in secondi")
 
 
 def get_auth_username() -> str:

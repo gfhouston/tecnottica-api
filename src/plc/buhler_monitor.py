@@ -1,10 +1,14 @@
 import asyncio
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 import httpx
 
 from .buhler_models import BuhlerState
 from .buhler_registry import BuhlerRegistry
+
+if TYPE_CHECKING:
+    import aiomysql
 
 
 class BuhlerVentingMonitor:
@@ -23,11 +27,13 @@ class BuhlerVentingMonitor:
         poll_interval: float,
         webhook_url: str | None,
         log_file: str,
+        db: "aiomysql.Pool | None" = None,
     ) -> None:
         self._registry = registry
         self._poll_interval = poll_interval
         self._webhook_url = webhook_url
         self._log_file = log_file
+        self._db = db
         self._was_vent_running: dict[str, bool] = {}
         self._task: asyncio.Task | None = None
 
@@ -73,6 +79,17 @@ class BuhlerVentingMonitor:
 
     async def _fire(self, state: BuhlerState) -> None:
         ts = datetime.now(timezone.utc).isoformat()
+        production_order_ids: list[str] = []
+        if self._db is not None:
+            try:
+                from src.db import get_production_orders
+                production_order_ids = await get_production_orders(
+                    self._db, state.machine_id, state.recipe_name
+                )
+            except Exception as exc:
+                self._append_log(
+                    f"DB_ERR | machine={state.machine_id} | {type(exc).__name__}: {exc}"
+                )
         payload = {
             "event": "buhler_venting_stopped",
             "timestamp": ts,
@@ -81,6 +98,7 @@ class BuhlerVentingMonitor:
             "recipe_name": state.recipe_name,
             "next_recipe_name": state.next_recipe_name,
             "process_start": state.process_start,
+            "production_order_ids": production_order_ids,
         }
 
         self._append_log(

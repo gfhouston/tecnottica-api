@@ -2,11 +2,15 @@ import asyncio
 import os
 import re
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 import httpx
 
 from .models import MachineState, MachineStatus
 from .registry import MachineRegistry
+
+if TYPE_CHECKING:
+    import aiomysql
 
 _VENTING_RE = re.compile(r"Venting\s*\(\d+\s*of\s*\d+\)", re.IGNORECASE)
 _ACTIVE_STATUSES = {MachineStatus.RUNNING, MachineStatus.RUNNING_PAUSED}
@@ -28,11 +32,13 @@ class VentingMonitor:
         poll_interval: float,
         webhook_url: str | None,
         log_file: str,
+        db: "aiomysql.Pool | None" = None,
     ) -> None:
         self._registry = registry
         self._poll_interval = poll_interval
         self._webhook_url = webhook_url
         self._log_file = log_file
+        self._db = db
         self._was_venting_active: dict[str, bool] = {}
         self._task: asyncio.Task | None = None
 
@@ -79,13 +85,26 @@ class VentingMonitor:
 
     async def _fire(self, state: MachineState) -> None:
         ts = datetime.now(timezone.utc).isoformat()
+        production_order_ids: list[str] = []
+        if self._db is not None:
+            try:
+                from src.db import get_production_orders
+                production_order_ids = await get_production_orders(
+                    self._db, state.machine_id, state.order_part_program
+                )
+            except Exception as exc:
+                self._append_log(
+                    f"DB_ERR | machine={state.machine_id} | {type(exc).__name__}: {exc}"
+                )
         payload = {
             "event": "venting_stopped",
             "timestamp": ts,
             "machine_id": state.machine_id,
+            "order_part_program": state.order_part_program,
             "working_phase": state.working_phase,
             "machine_status": state.machine_status.value,
             "alarm_code": state.alarm_code,
+            "production_order_ids": production_order_ids,
         }
 
         self._append_log(

@@ -1,46 +1,41 @@
 from typing import Any
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class TimestampField(BaseModel):
-    """
-    Il PLC Buhler restituisce i campi timestamp come stringhe che concatenano
-    nome (step/ricetta) e timestamp nel formato YYYY-MM-DD-HH:MM:SS.mmm.
-    Questo modello li espone già separati.
-    """
-    label: str | None      # nome step o ricetta estratto
-    timestamp: str | None  # ISO 8601: YYYY-MM-DDTHH:MM:SS.mmm (None se assente)
-    raw: str | None        # valore originale dal PLC
+    label: str | None = Field(description="Nome dello step o della ricetta estratto dalla stringa OPC-UA")
+    timestamp: str | None = Field(description="Timestamp in formato ISO 8601 (YYYY-MM-DDTHH:MM:SS.mmm), None se assente")
+    raw: str | None = Field(description="Valore originale restituito dal PLC Buhler")
 
 
 class BuhlerState(BaseModel):
-    machine_id: str
+    machine_id: str = Field(description="Identificatore univoco della macchina Buhler")
     # CMD nodes
-    next_recipe_name: str
-    send_next_recipe: bool | None
+    next_recipe_name: str = Field(description="Nome della prossima ricetta da avviare (nodo CMD.Process_NextRecipeName)")
+    send_next_recipe: bool | None = Field(description="Flag di invio ricetta (nodo CMD.Process_SendNextRecipe)")
     # ACT process nodes
-    recipe_name: str
-    step_name: str
-    step_number: Any
-    step_time: Any
-    step_start_timestamp: TimestampField | None
-    step_end_timestamp: TimestampField | None
-    start_timestamp: TimestampField | None
-    end_timestamp: TimestampField | None
+    recipe_name: str = Field(description="Nome della ricetta in esecuzione (nodo ACT.recipe_name)")
+    step_name: str = Field(description="Nome dello step corrente (nodo ACT.step_name)")
+    step_number: Any = Field(description="Numero dello step corrente")
+    step_time: Any = Field(description="Durata dello step corrente")
+    step_start_timestamp: TimestampField | None = Field(description="Timestamp di inizio step corrente")
+    step_end_timestamp: TimestampField | None = Field(description="Timestamp di fine step corrente")
+    start_timestamp: TimestampField | None = Field(description="Timestamp di inizio processo")
+    end_timestamp: TimestampField | None = Field(description="Timestamp di fine processo")
     # STA nodes
-    mode_idle: bool | None
-    process_start: bool
-    process_stop: bool | None
-    process_end: bool | None
+    mode_idle: bool | None = Field(description="True se la macchina è in modalità idle (nodo STA)")
+    process_start: bool = Field(description="True se il processo è avviato (nodo STA.process_start)")
+    process_stop: bool | None = Field(description="True se il processo è in arresto (nodo STA.process_stop)")
+    process_end: bool | None = Field(description="True se il processo è terminato (nodo STA.process_end)")
     # Temperature
-    water_temp_inlet_coldwater: float | None
+    water_temp_inlet_coldwater: float | None = Field(description="Temperatura acqua fredda in ingresso (°C)")
     # Derived
-    is_running: bool
+    is_running: bool = Field(description="True se la macchina è in esecuzione (derivato da process_start e mode_idle)")
 
 
 class WriteRecipeRequest(BaseModel):
-    recipe_name: str
+    recipe_name: str = Field(description="Nome della ricetta da inviare al PLC Buhler (max 256 caratteri)")
 
     @field_validator("recipe_name")
     @classmethod
@@ -51,6 +46,6 @@ class WriteRecipeRequest(BaseModel):
 
 
 class BuhlerMachineInfo(BaseModel):
-    machine_id: str
-    name: str
-    url: str
+    machine_id: str = Field(description="Identificatore univoco della macchina Buhler")
+    name: str = Field(description="Nome descrittivo della macchina")
+    url: str = Field(description="URL del server OPC-UA (es. opc.tcp://192.168.1.10:4840)")

@@ -1,6 +1,6 @@
 from enum import Enum
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class MachineStatus(str, Enum):
@@ -10,20 +10,26 @@ class MachineStatus(str, Enum):
 
 
 class MachineState(BaseModel):
-    machine_id: str
-    order_part_program: str
-    working_phase: str
-    partprogram_name: str
-    status_raw: int
-    control_raw: int
-    control_binary: str   # es. "0110 0100 1100 0010"
-    control_hex: str      # es. "64C2"
-    machine_status: MachineStatus
-    alarm_code: int
+    machine_id: str = Field(description="Identificatore univoco della macchina")
+    order_part_program: str = Field(description="Codice commessa/part program attivo")
+    working_phase: str = Field(description="Fase di lavorazione corrente (stringa descrittiva)")
+    partprogram_name: str = Field(description="Nome del part program letto dal PLC")
+    status_raw: int = Field(description="Valore grezzo del registro di stato (DB10)")
+    control_raw: int = Field(description="Valore grezzo del registro di controllo (DB10)")
+    control_binary: str = Field(description="Registro di controllo in formato binario, es. '0110 0100 1100 0010'")
+    control_hex: str = Field(description="Registro di controllo in formato esadecimale, es. '64C2'")
+    machine_status: MachineStatus = Field(description="Stato operativo della macchina")
+    alarm_code: int = Field(description="Codice allarme corrente (0 = nessun allarme)")
 
 
 class WriteOrderRequest(BaseModel):
-    order_part_program: str
+    order_part_program: str = Field(
+        description="Codice commessa o part program da scrivere sul PLC (max 50 caratteri ASCII)"
+    )
+    production_order_ids: list[str] = Field(
+        default=[],
+        description="Lista degli ID degli ordini di produzione da associare alla commessa",
+    )
 
     @field_validator("order_part_program")
     @classmethod
@@ -38,8 +44,8 @@ class WriteOrderRequest(BaseModel):
 
 
 class MachineInfo(BaseModel):
-    machine_id: str
-    name: str
-    ip: str
-    rack: int
-    slot: int
+    machine_id: str = Field(description="Identificatore univoco della macchina")
+    name: str = Field(description="Nome descrittivo della macchina")
+    ip: str = Field(description="Indirizzo IP del PLC Step7")
+    rack: int = Field(description="Numero rack del PLC")
+    slot: int = Field(description="Numero slot del PLC")
