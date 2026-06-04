@@ -40,6 +40,7 @@ class VentingMonitor:
         self._log_file = log_file
         self._db = db
         self._was_venting_active: dict[str, bool] = {}
+        self._last_phase: dict[str, str] = {}
         self._task: asyncio.Task | None = None
 
     def start(self) -> None:
@@ -77,6 +78,13 @@ class VentingMonitor:
         is_active = state.machine_status in _ACTIVE_STATUSES
 
         was_venting_active = self._was_venting_active.get(mid, False)
+
+        if state.working_phase != self._last_phase.get(mid):
+            self._append_log(
+                f"PHASE_CHANGE | machine={mid} | phase={state.working_phase!r}"
+                f" | status={state.machine_status.value}"
+            )
+            self._last_phase[mid] = state.working_phase
 
         if was_venting_active and is_venting and not is_active:
             await self._fire(state)

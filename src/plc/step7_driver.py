@@ -87,8 +87,14 @@ class Step7Driver:
 # ------------------------------------------------------------------
 
 def _parse_char_array(data: bytes | bytearray, start: int, length: int) -> str:
-    """Legge un CHAR ARRAY[n] raw, filtrando i caratteri non stampabili (0x00-0x1F, 0x7F+)."""
+    """Legge una STRING Siemens S7: byte 0 = max_len, byte 1 = actual_len, poi i caratteri."""
     segment = data[start : start + length]
+    if len(segment) >= 2:
+        max_len, actual_len = segment[0], segment[1]
+        if 0 < actual_len <= max_len <= length - 2:
+            segment = segment[2 : 2 + actual_len]
+        else:
+            segment = segment.split(b"\x00")[0]
     return "".join(chr(b) for b in segment if 0x20 <= b <= 0x7E).rstrip()
 
 
