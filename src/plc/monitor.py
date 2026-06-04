@@ -133,7 +133,7 @@ class VentingMonitor:
                 )
 
     def _append_log(self, message: str) -> None:
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         line = f"{ts} | {message}\n"
         try:
             with open(self._log_file, "a") as f:
