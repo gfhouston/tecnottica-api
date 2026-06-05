@@ -41,6 +41,7 @@ class VentingMonitor:
         self._db = db
         self._was_venting_active: dict[str, bool] = {}
         self._last_phase: dict[str, str] = {}
+        self._last_venting_phase: dict[str, str] = {}
         self._task: asyncio.Task | None = None
 
     def start(self) -> None:
@@ -86,12 +87,15 @@ class VentingMonitor:
             )
             self._last_phase[mid] = state.working_phase
 
-        if was_venting_active and is_venting and not is_active:
-            await self._fire(state)
+        if is_venting and is_active:
+            self._last_venting_phase[mid] = state.working_phase
+
+        if was_venting_active and not is_active:
+            await self._fire(state, self._last_venting_phase.get(mid, state.working_phase))
 
         self._was_venting_active[mid] = is_venting and is_active
 
-    async def _fire(self, state: MachineState) -> None:
+    async def _fire(self, state: MachineState, venting_phase: str) -> None:
         ts = datetime.now(timezone.utc).isoformat()
         production_order_ids: list[str] = []
         if self._db is not None:
@@ -109,7 +113,7 @@ class VentingMonitor:
             "timestamp": ts,
             "machine_id": state.machine_id,
             "order_part_program": state.order_part_program,
-            "working_phase": state.working_phase,
+            "working_phase": venting_phase,
             "machine_status": state.machine_status.value,
             "alarm_code": state.alarm_code,
             "production_order_ids": production_order_ids,

@@ -36,6 +36,7 @@ class BuhlerVentingMonitor:
         self._db = db
         self._was_vent_running: dict[str, bool] = {}
         self._last_step: dict[str, str] = {}
+        self._last_vent_step: dict[str, str] = {}
         self._task: asyncio.Task | None = None
 
     def start(self) -> None:
@@ -80,12 +81,15 @@ class BuhlerVentingMonitor:
             )
             self._last_step[mid] = state.step_name
 
-        if was_vent_running and is_vent and not is_running:
-            await self._fire(state)
+        if is_vent and is_running:
+            self._last_vent_step[mid] = state.step_name
+
+        if was_vent_running and not is_running:
+            await self._fire(state, self._last_vent_step.get(mid, state.step_name))
 
         self._was_vent_running[mid] = is_vent and is_running
 
-    async def _fire(self, state: BuhlerState) -> None:
+    async def _fire(self, state: BuhlerState, vent_step: str) -> None:
         ts = datetime.now(timezone.utc).isoformat()
         production_order_ids: list[str] = []
         if self._db is not None:
@@ -102,7 +106,7 @@ class BuhlerVentingMonitor:
             "event": "buhler_venting_stopped",
             "timestamp": ts,
             "machine_id": state.machine_id,
-            "step_name": state.step_name,
+            "step_name": vent_step,
             "recipe_name": state.recipe_name,
             "next_recipe_name": state.next_recipe_name,
             "process_start": state.process_start,
