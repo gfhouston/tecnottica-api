@@ -35,6 +35,7 @@ class BuhlerVentingMonitor:
         self._log_file = log_file
         self._db = db
         self._was_vent_running: dict[str, bool] = {}
+        self._last_step: dict[str, str] = {}
         self._task: asyncio.Task | None = None
 
     def start(self) -> None:
@@ -71,6 +72,13 @@ class BuhlerVentingMonitor:
         is_running = state.process_start
 
         was_vent_running = self._was_vent_running.get(mid, False)
+
+        if state.step_name != self._last_step.get(mid):
+            self._append_log(
+                f"PHASE_CHANGE | machine={mid} | step={state.step_name!r}"
+                f" | process_start={state.process_start}"
+            )
+            self._last_step[mid] = state.step_name
 
         if was_vent_running and is_vent and not is_running:
             await self._fire(state)
@@ -119,7 +127,7 @@ class BuhlerVentingMonitor:
                 )
 
     def _append_log(self, message: str) -> None:
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         line = f"{ts} | {message}\n"
         try:
             with open(self._log_file, "a") as f:
