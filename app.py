@@ -9,6 +9,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBasic, HTTPBearer
 from fastapi.responses import JSONResponse
 
 from src.db import init_db, save_assignment
+from src.settings import EmailSettings
 from src.local_auth import (
     LoginRequest,
     authenticate,
@@ -46,6 +47,18 @@ async def lifespan(app: FastAPI):
 
     log_file = os.environ.get("VENTING_LOG_FILE", "/tmp/venting_events.log")
     webhook_url = os.environ.get("VENTING_WEBHOOK_URL") or None
+    slack_webhook_url = os.environ.get(
+        "SLACK_WEBHOOK_URL",
+        "",
+    )
+    email_settings = EmailSettings(
+        smtp_host=os.environ.get("SMTP_HOST", ""),
+        smtp_port=int(os.environ.get("SMTP_PORT", "")),
+        smtp_user=os.environ.get("SMTP_USER", ""),
+        smtp_password=os.environ.get("SMTP_PASSWORD", ""),
+        from_name=os.environ.get("EMAIL_FROM_NAME", ""),
+        to_address=os.environ.get("EMAIL_TO", ""),
+    )
 
     monitor = VentingMonitor(
         registry=_unified.step7,
@@ -53,6 +66,8 @@ async def lifespan(app: FastAPI):
         webhook_url=webhook_url,
         log_file=log_file,
         db=_db,
+        slack_webhook_url=slack_webhook_url,
+        email_settings=email_settings,
     )
     monitor.start()
 
@@ -62,6 +77,8 @@ async def lifespan(app: FastAPI):
         webhook_url=os.environ.get("BUHLER_VENTING_WEBHOOK_URL") or webhook_url,
         log_file=log_file,
         db=_db,
+        slack_webhook_url=slack_webhook_url,
+        email_settings=email_settings,
     )
     buhler_monitor.start()
 

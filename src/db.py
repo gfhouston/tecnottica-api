@@ -20,8 +20,14 @@ CREATE TABLE IF NOT EXISTS order_assignments (
     order_part_program   VARCHAR(128)  NOT NULL,
     production_order_ids JSON          NOT NULL,
     assigned_at          DATETIME(6)   NOT NULL,
+    ended_at             DATETIME(6)   NULL,
     INDEX idx_machine_order (machine_id, order_part_program)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+_ALTER_ADD_ENDED_AT = """
+ALTER TABLE order_assignments
+ADD COLUMN IF NOT EXISTS ended_at DATETIME(6) NULL
 """
 
 
@@ -46,6 +52,7 @@ async def init_db(
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute(_CREATE_TABLE)
+            await cur.execute(_ALTER_ADD_ENDED_AT)
     return pool
 
 
@@ -121,3 +128,22 @@ async def get_production_orders(
     if isinstance(value, str):
         return json.loads(value)
     return list(value) if value else []
+
+
+async def set_ended_at(
+    pool: aiomysql.Pool,
+    machine_id: str,
+    order_part_program: str,
+) -> None:
+    """Scrive ended_at sulla riga (machine_id, order_part_program) al momento di fine lavoro."""
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE order_assignments SET ended_at = %s "
+                "WHERE machine_id = %s AND order_part_program = %s",
+                (
+                    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f"),
+                    machine_id,
+                    order_part_program,
+                ),
+            )
