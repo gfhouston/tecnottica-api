@@ -120,7 +120,7 @@ class VentingMonitor:
         }
 
         self._append_log(
-            f"EVENT | machine={state.machine_id} | phase={state.working_phase!r} "
+            f"END_OF_WORK | machine={state.machine_id} | phase={state.working_phase!r} "
             f"| status={state.machine_status.value} | alarm={state.alarm_code}"
         )
 

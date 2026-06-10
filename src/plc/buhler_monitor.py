@@ -13,10 +13,10 @@ if TYPE_CHECKING:
 
 class BuhlerVentingMonitor:
     """
-    Polling task che rileva la transizione su macchine Buhler OPC-UA:
-      Process_StepName == "Vent"  +  Process_Start == 1 (in esecuzione)
+    Polling task che rileva la fine lavoro su macchine Buhler OPC-UA:
+      fase != "Venting"  +  Process_Start == True  (lavorazione in corso)
       →
-      Process_StepName == "Vent"  +  Process_Start == 0 (arresto)
+      fase == "Venting"  +  Process_Start == False  (fine lavorazione)
 
     Alla rilevazione: POST webhook + append su log file.
     """
@@ -34,9 +34,9 @@ class BuhlerVentingMonitor:
         self._webhook_url = webhook_url
         self._log_file = log_file
         self._db = db
-        self._was_vent_running: dict[str, bool] = {}
         self._last_step: dict[str, str] = {}
-        self._last_vent_step: dict[str, str] = {}
+        self._prev_step: dict[str, str | None] = {}
+        self._prev_running: dict[str, bool] = {}
         self._task: asyncio.Task | None = None
 
     def start(self) -> None:
@@ -69,10 +69,6 @@ class BuhlerVentingMonitor:
 
     async def _check(self, state: BuhlerState) -> None:
         mid = state.machine_id
-        is_vent = state.step_name == "Vent"
-        is_running = state.process_start
-
-        was_vent_running = self._was_vent_running.get(mid, False)
 
         if state.step_name != self._last_step.get(mid):
             self._append_log(
@@ -81,15 +77,23 @@ class BuhlerVentingMonitor:
             )
             self._last_step[mid] = state.step_name
 
-        if is_vent and is_running:
-            self._last_vent_step[mid] = state.step_name
+        prev_step = self._prev_step.get(mid)
+        prev_running = self._prev_running.get(mid, False)
 
-        if was_vent_running and not is_running:
-            await self._fire(state, self._last_vent_step.get(mid, state.step_name))
+        # Fine lavoro: da fase != Venting con process_start=True → Venting con process_start=False
+        if (
+            prev_step is not None
+            and prev_step != "Venting"
+            and prev_running
+            and state.step_name == "Venting"
+            and not state.process_start
+        ):
+            await self._fire(state, prev_step)
 
-        self._was_vent_running[mid] = is_vent and is_running
+        self._prev_step[mid] = state.step_name
+        self._prev_running[mid] = state.process_start
 
-    async def _fire(self, state: BuhlerState, vent_step: str) -> None:
+    async def _fire(self, state: BuhlerState, last_work_step: str) -> None:
         ts = datetime.now(timezone.utc).isoformat()
         production_order_ids: list[str] = []
         if self._db is not None:
@@ -103,10 +107,10 @@ class BuhlerVentingMonitor:
                     f"DB_ERR | machine={state.machine_id} | {type(exc).__name__}: {exc}"
                 )
         payload = {
-            "event": "buhler_venting_stopped",
+            "event": "buhler_end_of_work",
             "timestamp": ts,
             "machine_id": state.machine_id,
-            "step_name": vent_step,
+            "last_work_step": last_work_step,
             "recipe_name": state.recipe_name,
             "next_recipe_name": state.next_recipe_name,
             "process_start": state.process_start,
@@ -114,8 +118,8 @@ class BuhlerVentingMonitor:
         }
 
         self._append_log(
-            f"EVENT | machine={state.machine_id} | step={state.step_name!r} "
-            f"| process_start={state.process_start} | recipe={state.recipe_name!r}"
+            f"END_OF_WORK | machine={state.machine_id} | last_step={last_work_step!r}"
+            f" | recipe={state.recipe_name!r}"
         )
 
         if self._webhook_url:
