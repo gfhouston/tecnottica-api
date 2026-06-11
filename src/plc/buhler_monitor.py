@@ -5,6 +5,27 @@ from datetime import datetime, timezone
 from email.mime.text import MIMEText
 from typing import TYPE_CHECKING
 
+
+def _fmt_sec(sec: float) -> str:
+    sec = int(sec)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
+def _format_timing(timing_data: dict | None) -> str:
+    if not timing_data:
+        return ""
+    return (
+        f"\n1ª fase (50%): {_fmt_sec(timing_data['t_first_phase_seconds'])}"
+        f" | lavorazione (100%): {_fmt_sec(timing_data['t_working_seconds'])}"
+        f" | venting (30%): {_fmt_sec(timing_data['t_venting_seconds'])}"
+    )
+
 import httpx
 
 from src.settings import EmailSettings
@@ -22,6 +43,8 @@ class BuhlerVentingMonitor:
       →
       fase == "Venting"  +  Process_Start == False  (fine lavorazione)
 
+    Il cambio fase è considerato reale solo quando step_number E step_name
+    cambiano contemporaneamente nello stesso tick di polling.
     Alla rilevazione: POST webhook + append su log file.
     """
 
@@ -42,9 +65,12 @@ class BuhlerVentingMonitor:
         self._db = db
         self._slack_webhook_url = slack_webhook_url
         self._email_settings = email_settings
-        self._last_step: dict[str, str] = {}
-        self._prev_step: dict[str, str | None] = {}
+        self._prev_step_name: dict[str, str | None] = {}
+        self._prev_step_number: dict[str, object] = {}
         self._prev_running: dict[str, bool] = {}
+        self._job_start_time: dict[str, datetime] = {}
+        self._first_phase_end_time: dict[str, datetime] = {}
+        self._venting_start_time: dict[str, datetime] = {}
         self._task: asyncio.Task | None = None
 
     def start(self) -> None:
@@ -91,32 +117,73 @@ class BuhlerVentingMonitor:
 
     async def _check(self, state: BuhlerState) -> None:
         mid = state.machine_id
+        now = datetime.now(timezone.utc)
 
-        if state.step_name != self._last_step.get(mid):
-            self._append_log(
-                f"PHASE_CHANGE | machine={mid} | step={state.step_name!r}"
-                f" | process_start={state.process_start}"
-            )
-            self._last_step[mid] = state.step_name
-
-        prev_step = self._prev_step.get(mid)
+        prev_step_name = self._prev_step_name.get(mid)
+        prev_step_number = self._prev_step_number.get(mid)
         prev_running = self._prev_running.get(mid, False)
 
-        # Fine lavoro: da fase != Venting con process_start=True → Venting con process_start=False
+        step_name_changed = state.step_name != prev_step_name
+        step_number_changed = state.step_number != prev_step_number
+
+        # Avvio macchina (o prima osservazione come attiva)
+        if state.process_start and not prev_running:
+            self._job_start_time[mid] = now
+            self._first_phase_end_time.pop(mid, None)
+            self._venting_start_time.pop(mid, None)
+
+        # Cambio fase reale: step_number E step_name cambiano contemporaneamente
+        if step_name_changed and step_number_changed:
+            self._append_log(
+                f"PHASE_CHANGE | machine={mid} | step_num={state.step_number} | step={state.step_name!r}"
+                f" | process_start={state.process_start}"
+            )
+            # Traccia fine prima fase e inizio venting (solo dopo aver visto almeno uno step precedente)
+            if prev_step_name is not None:
+                if mid not in self._first_phase_end_time:
+                    self._first_phase_end_time[mid] = now
+                if state.step_name == "Venting" and mid not in self._venting_start_time:
+                    self._venting_start_time[mid] = now
+
+        # Fine lavoro: da fase != Venting con process_start=True → Venting (step_name E step_number cambiano) con process_start=False
         if (
-            prev_step is not None
-            and prev_step != "Venting"
+            prev_step_name is not None
+            and prev_step_name != "Venting"
             and prev_running
             and state.step_name == "Venting"
+            and step_number_changed
             and not state.process_start
         ):
-            await self._fire(state, prev_step)
+            await self._fire(state, prev_step_name)
 
-        self._prev_step[mid] = state.step_name
+        self._prev_step_name[mid] = state.step_name
+        self._prev_step_number[mid] = state.step_number
         self._prev_running[mid] = state.process_start
 
     async def _fire(self, state: BuhlerState, last_work_step: str) -> None:
-        ts = datetime.now(timezone.utc).isoformat()
+        fire_dt = datetime.now(timezone.utc)
+        ts = fire_dt.isoformat()
+        mid = state.machine_id
+
+        # Calcolo tempi di lavorazione
+        job_start = self._job_start_time.get(mid)
+        first_phase_end = self._first_phase_end_time.get(mid)
+        venting_start = self._venting_start_time.get(mid)
+        timing_data: dict | None = None
+        if job_start is not None:
+            t_first = (first_phase_end or fire_dt) - job_start
+            t_working = (venting_start or fire_dt) - (first_phase_end or job_start)
+            t_venting = fire_dt - (venting_start or fire_dt)
+            timing_data = {
+                "t_first_phase_seconds": max(0.0, t_first.total_seconds()),
+                "t_working_seconds": max(0.0, t_working.total_seconds()),
+                "t_venting_seconds": max(0.0, t_venting.total_seconds()),
+            }
+        # Reset timer per il prossimo ciclo
+        self._job_start_time.pop(mid, None)
+        self._first_phase_end_time.pop(mid, None)
+        self._venting_start_time.pop(mid, None)
+
         production_order_ids: list[str] = []
         if self._db is not None:
             try:
@@ -124,7 +191,7 @@ class BuhlerVentingMonitor:
                 production_order_ids = await get_production_orders(
                     self._db, state.machine_id, state.next_recipe_name
                 )
-                await set_ended_at(self._db, state.machine_id, state.next_recipe_name)
+                await set_ended_at(self._db, state.machine_id, state.next_recipe_name, timing_data)
             except Exception as exc:
                 self._append_log(
                     f"DB_ERR | machine={state.machine_id} | {type(exc).__name__}: {exc}"
@@ -135,6 +202,7 @@ class BuhlerVentingMonitor:
             "machine_id": state.machine_id,
             "order_part_program": state.next_recipe_name,
             "production_order_ids": production_order_ids,
+            "timing_data": timing_data,
         }
 
         self._append_log(
@@ -155,11 +223,19 @@ class BuhlerVentingMonitor:
                 )
 
         orders_str = ", ".join(production_order_ids) if production_order_ids else "—"
+        timing_str = _format_timing(timing_data)
         await self._notify_slack(
             f"*Fine lavoro Buhler* | `{state.machine_id}`\n"
             f"Programma: `{state.next_recipe_name}`\n"
-            f"Ordini: {orders_str}",
+            f"Ordini: {orders_str}{timing_str}",
             machine_id=state.machine_id,
+        )
+        email_timing = (
+            f"\nTempi di lavorazione:\n"
+            f"  1ª fase (50%):       {_fmt_sec(timing_data['t_first_phase_seconds'])}\n"
+            f"  Lavorazione (100%): {_fmt_sec(timing_data['t_working_seconds'])}\n"
+            f"  Venting (30%):      {_fmt_sec(timing_data['t_venting_seconds'])}\n"
+            if timing_data else ""
         )
         await self._notify_email(
             subject=f"Fine lavoro Buhler | {state.machine_id} | {state.next_recipe_name}",
@@ -168,6 +244,7 @@ class BuhlerVentingMonitor:
                 f"Macchina: {state.machine_id}\n"
                 f"Programma: {state.next_recipe_name}\n"
                 f"Ordini di produzione: {orders_str}\n"
+                f"{email_timing}"
             ),
             machine_id=state.machine_id,
         )

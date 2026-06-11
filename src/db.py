@@ -30,6 +30,11 @@ ALTER TABLE order_assignments
 ADD COLUMN IF NOT EXISTS ended_at DATETIME(6) NULL
 """
 
+_ALTER_ADD_TIMING_DATA = """
+ALTER TABLE order_assignments
+ADD COLUMN IF NOT EXISTS timing_data JSON NULL
+"""
+
 
 async def init_db(
     host: str,
@@ -53,6 +58,7 @@ async def init_db(
         async with conn.cursor() as cur:
             await cur.execute(_CREATE_TABLE)
             await cur.execute(_ALTER_ADD_ENDED_AT)
+            await cur.execute(_ALTER_ADD_TIMING_DATA)
     return pool
 
 
@@ -134,15 +140,17 @@ async def set_ended_at(
     pool: aiomysql.Pool,
     machine_id: str,
     order_part_program: str,
+    timing_data: dict | None = None,
 ) -> None:
-    """Scrive ended_at sulla riga (machine_id, order_part_program) al momento di fine lavoro."""
+    """Scrive ended_at e timing_data sulla riga (machine_id, order_part_program) al momento di fine lavoro."""
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                "UPDATE order_assignments SET ended_at = %s "
+                "UPDATE order_assignments SET ended_at = %s, timing_data = %s "
                 "WHERE machine_id = %s AND order_part_program = %s",
                 (
                     datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f"),
+                    json.dumps(timing_data) if timing_data is not None else None,
                     machine_id,
                     order_part_program,
                 ),

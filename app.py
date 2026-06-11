@@ -68,6 +68,7 @@ async def lifespan(app: FastAPI):
         db=_db,
         slack_webhook_url=slack_webhook_url,
         email_settings=email_settings,
+        trigger_mode=os.environ.get("OPTOTECH_END_OF_WORK_TRIGGER", "venting_stop"),
     )
     monitor.start()
 
