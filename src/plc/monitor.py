@@ -3,6 +3,7 @@ import os
 import re
 import smtplib
 import ssl
+import uuid
 from datetime import datetime, timezone
 from email.mime.text import MIMEText
 from typing import TYPE_CHECKING
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
 
 _VENTING_RE = re.compile(r"Venting\s*\(\d+\s*of\s*\d+\)", re.IGNORECASE)
 _ACTIVE_STATUSES = {MachineStatus.RUNNING, MachineStatus.RUNNING_PAUSED}
+_ERROR_NOTIFY_COOLDOWN = 1800  # secondi tra notifiche ripetute durante outage prolungato
 
 
 def _fmt_sec(sec: float) -> str:
@@ -68,6 +70,7 @@ class VentingMonitor:
         slack_webhook_url: str | None = None,
         email_settings: EmailSettings | None = None,
         trigger_mode: str = TRIGGER_VENTING_STOP,
+        plc_timeout: float = 10.0,
     ) -> None:
         self._registry = registry
         self._poll_interval = poll_interval
@@ -83,7 +86,12 @@ class VentingMonitor:
         self._job_start_time: dict[str, datetime] = {}
         self._first_phase_end_time: dict[str, datetime] = {}
         self._venting_start_time: dict[str, datetime] = {}
+        self._plc_timeout = plc_timeout
         self._task: asyncio.Task | None = None
+        self._polling_error: dict[str, bool] = {}
+        self._error_since: dict[str, datetime] = {}
+        self._last_error_notified: dict[str, datetime] = {}
+        self._pre_error_active: dict[str, bool] = {}
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name="venting_monitor")
@@ -99,34 +107,106 @@ class VentingMonitor:
     # ------------------------------------------------------------------
 
     async def _run(self) -> None:
-        loop = asyncio.get_event_loop()
         while True:
             for info in self._registry.list_machines():
+                mid = info.machine_id
                 try:
-                    driver = self._registry.get(info.machine_id)
-                    state: MachineState = await loop.run_in_executor(None, driver.read_state)
+                    driver = self._registry.get(mid)
+                    state: MachineState = await asyncio.wait_for(
+                        driver.read_state_async(),
+                        timeout=self._plc_timeout + 2.0,
+                    )
+                    if self._polling_error.get(mid):
+                        await self._on_recovery(mid, state)
                     await self._check(state)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    self._append_log(
-                        f"POLL_ERROR | machine={info.machine_id} | {type(exc).__name__}: {exc}"
-                    )
-                    await self._notify_slack(
-                        f"*POLL_ERROR Optotech* | `{info.machine_id}`\n"
-                        f"{type(exc).__name__}: {exc}",
-                        machine_id=info.machine_id,
-                    )
-                    await self._notify_email(
-                        subject=f"POLL_ERROR Optotech | {info.machine_id}",
-                        body=(
-                            f"Errore di polling su macchina Optotech.\n\n"
-                            f"Macchina: {info.machine_id}\n"
-                            f"{type(exc).__name__}: {exc}\n"
-                        ),
-                        machine_id=info.machine_id,
-                    )
+                    await self._on_poll_error(mid, exc)
             await asyncio.sleep(self._poll_interval)
+
+    async def _on_poll_error(self, mid: str, exc: Exception) -> None:
+        now = datetime.now(timezone.utc)
+        self._append_log(f"POLL_ERROR | machine={mid} | {type(exc).__name__}: {exc}")
+        if not self._polling_error.get(mid):
+            self._polling_error[mid] = True
+            self._error_since[mid] = now
+            self._pre_error_active[mid] = (
+                self._was_venting_active.get(mid, False)
+                or self._was_working_active.get(mid, False)
+            )
+            await self._notify_slack(
+                f"*POLL_ERROR Optotech* | `{mid}`\n{type(exc).__name__}: {exc}",
+                machine_id=mid,
+            )
+            await self._notify_email(
+                subject=f"POLL_ERROR Optotech | {mid}",
+                body=(
+                    f"Errore di polling su macchina Optotech.\n\n"
+                    f"Macchina: {mid}\n{type(exc).__name__}: {exc}\n"
+                ),
+                machine_id=mid,
+            )
+            self._last_error_notified[mid] = now
+        else:
+            last = self._last_error_notified.get(mid)
+            if last is None or (now - last).total_seconds() >= _ERROR_NOTIFY_COOLDOWN:
+                elapsed = _fmt_sec((now - self._error_since[mid]).total_seconds())
+                await self._notify_slack(
+                    f"*POLL_ERROR Optotech (in corso da {elapsed})* | `{mid}`\n"
+                    f"{type(exc).__name__}: {exc}",
+                    machine_id=mid,
+                )
+                await self._notify_email(
+                    subject=f"POLL_ERROR Optotech | {mid}",
+                    body=(
+                        f"Errore di polling su macchina Optotech (in corso da {elapsed}).\n\n"
+                        f"Macchina: {mid}\n{type(exc).__name__}: {exc}\n"
+                    ),
+                    machine_id=mid,
+                )
+                self._last_error_notified[mid] = now
+
+    async def _on_recovery(self, mid: str, state: MachineState) -> None:
+        error_since = self._error_since.get(mid)
+        elapsed = _fmt_sec((datetime.now(timezone.utc) - error_since).total_seconds()) if error_since else "?"
+        was_active = self._pre_error_active.get(mid, False)
+        is_active = state.machine_status in _ACTIVE_STATUSES
+
+        self._append_log(f"POLL_OK | machine={mid} | ripristinato dopo {elapsed}")
+
+        base_msg = f"*PLC Optotech tornato online* | `{mid}` | assente da {elapsed}"
+        base_body = f"Il PLC Optotech è tornato raggiungibile.\n\nMacchina: {mid}\nAssenza: {elapsed}\n"
+
+        if was_active and not is_active:
+            self._append_log(
+                f"MISSED_EVENT? | machine={mid} | era attiva prima del blackout, ora è ferma"
+            )
+            await self._notify_slack(
+                base_msg + "\n*ATTENZIONE*: la macchina era attiva prima del blackout "
+                "ed è ora ferma. Un evento di fine lavoro potrebbe essere andato perso.",
+                machine_id=mid,
+            )
+            await self._notify_email(
+                subject=f"PLC tornato online | {mid} | POSSIBILE EVENTO PERSO",
+                body=base_body + (
+                    "\nATTENZIONE: la macchina era attiva prima del blackout ed è ora ferma.\n"
+                    "Un evento di fine lavoro potrebbe essere andato perso.\n"
+                ),
+                machine_id=mid,
+            )
+        else:
+            await self._notify_slack(base_msg, machine_id=mid)
+            await self._notify_email(
+                subject=f"PLC tornato online | {mid}",
+                body=base_body,
+                machine_id=mid,
+            )
+
+        self._polling_error.pop(mid, None)
+        self._error_since.pop(mid, None)
+        self._last_error_notified.pop(mid, None)
+        self._pre_error_active.pop(mid, None)
 
     async def _check(self, state: MachineState) -> None:
         mid = state.machine_id
@@ -208,6 +288,7 @@ class VentingMonitor:
                     f"DB_ERR | machine={state.machine_id} | {type(exc).__name__}: {exc}"
                 )
         payload = {
+            "event_id": f"optotech:{state.machine_id}:{uuid.uuid4().hex}",
             "event": "optotech_end_of_work",
             "timestamp": ts,
             "machine_id": state.machine_id,
@@ -222,16 +303,7 @@ class VentingMonitor:
         )
 
         if self._webhook_url:
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as http:
-                    r = await http.post(self._webhook_url, json=payload)
-                    self._append_log(
-                        f"WEBHOOK_OK | machine={state.machine_id} | http={r.status_code}"
-                    )
-            except Exception as exc:
-                self._append_log(
-                    f"WEBHOOK_ERR | machine={state.machine_id} | {type(exc).__name__}: {exc}"
-                )
+            await self._deliver_webhook(payload, state.machine_id)
 
         orders_str = ", ".join(production_order_ids) if production_order_ids else "—"
         timing_str = _format_timing(timing_data)
@@ -270,6 +342,57 @@ class VentingMonitor:
             self._append_log(
                 f"SLACK_ERR | machine={machine_id} | {type(exc).__name__}: {exc}"
             )
+
+    async def _deliver_webhook(self, payload: dict, machine_id: str) -> None:
+        if not self._webhook_url:
+            return
+        if self._db is None:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as http:
+                    response = await http.post(self._webhook_url, json=payload)
+                if response.status_code < 500:
+                    self._append_log(f"WEBHOOK_OK | machine={machine_id} | http={response.status_code}")
+                else:
+                    self._append_log(f"WEBHOOK_ERR | machine={machine_id} | http={response.status_code}")
+            except Exception as exc:
+                self._append_log(f"WEBHOOK_ERR | machine={machine_id} | {type(exc).__name__}: {exc}")
+            return
+
+        try:
+            from src.db import save_pending_event
+            from src.plc.webhook_retry import send_pending_webhook
+
+            pending_id = await save_pending_event(
+                self._db,
+                self._webhook_url,
+                payload,
+                event_id=payload["event_id"],
+            )
+            try:
+                delivered, status_code = await send_pending_webhook(
+                    self._db,
+                    pending_id,
+                    self._webhook_url,
+                    payload,
+                )
+                if delivered:
+                    self._append_log(f"WEBHOOK_OK | machine={machine_id} | id={pending_id} | http={status_code}")
+                else:
+                    self._append_log(f"WEBHOOK_PENDING | machine={machine_id} | id={pending_id} | http={status_code}")
+            except Exception as exc:
+                self._append_log(f"WEBHOOK_PENDING | machine={machine_id} | id={pending_id} | {type(exc).__name__}: {exc}")
+        except Exception as db_exc:
+            self._append_log(f"WEBHOOK_OUTBOX_ERR | machine={machine_id} | {type(db_exc).__name__}: {db_exc}")
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as http:
+                    response = await http.post(self._webhook_url, json=payload)
+                self._append_log(
+                    f"WEBHOOK_DIRECT_AFTER_OUTBOX_ERR | machine={machine_id} | http={response.status_code}"
+                )
+            except Exception as exc:
+                self._append_log(
+                    f"WEBHOOK_DIRECT_AFTER_OUTBOX_ERR | machine={machine_id} | {type(exc).__name__}: {exc}"
+                )
 
     async def _notify_email(self, subject: str, body: str, machine_id: str = "") -> None:
         if not self._email_settings:

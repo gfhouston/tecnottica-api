@@ -35,6 +35,26 @@ ALTER TABLE order_assignments
 ADD COLUMN IF NOT EXISTS timing_data JSON NULL
 """
 
+_CREATE_PENDING_WEBHOOK_EVENTS = """
+CREATE TABLE IF NOT EXISTS pending_webhook_events (
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    event_id        VARCHAR(128)  NULL,
+    url             VARCHAR(512)  NOT NULL,
+    payload         JSON          NOT NULL,
+    created_at      DATETIME(6)   NOT NULL,
+    last_attempt_at DATETIME(6)   NULL,
+    attempts        INT           NOT NULL DEFAULT 0,
+    delivered_at    DATETIME(6)   NULL,
+    INDEX idx_pending (delivered_at),
+    UNIQUE INDEX idx_webhook_event_id (event_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+"""
+
+_ALTER_ADD_WEBHOOK_EVENT_ID = """
+ALTER TABLE pending_webhook_events
+ADD COLUMN IF NOT EXISTS event_id VARCHAR(128) NULL
+"""
+
 
 async def init_db(
     host: str,
@@ -59,6 +79,20 @@ async def init_db(
             await cur.execute(_CREATE_TABLE)
             await cur.execute(_ALTER_ADD_ENDED_AT)
             await cur.execute(_ALTER_ADD_TIMING_DATA)
+            await cur.execute(_CREATE_PENDING_WEBHOOK_EVENTS)
+            await cur.execute(_ALTER_ADD_WEBHOOK_EVENT_ID)
+            await cur.execute(
+                "SELECT COUNT(1) FROM INFORMATION_SCHEMA.STATISTICS "
+                "WHERE TABLE_SCHEMA = DATABASE() "
+                "AND TABLE_NAME = 'pending_webhook_events' "
+                "AND INDEX_NAME = 'idx_webhook_event_id'"
+            )
+            row = await cur.fetchone()
+            if row is not None and int(row[0]) == 0:
+                await cur.execute(
+                    "ALTER TABLE pending_webhook_events "
+                    "ADD UNIQUE INDEX idx_webhook_event_id (event_id)"
+                )
     return pool
 
 
@@ -154,4 +188,78 @@ async def set_ended_at(
                     machine_id,
                     order_part_program,
                 ),
+            )
+
+
+async def save_pending_event(
+    pool: aiomysql.Pool,
+    url: str,
+    payload: dict,
+    event_id: str | None = None,
+) -> int:
+    """Salva un evento webhook in outbox. Restituisce l'id della riga."""
+    event_id = event_id or payload.get("event_id")
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO pending_webhook_events "
+                "(event_id, url, payload, created_at) VALUES (%s, %s, %s, %s) "
+                "ON DUPLICATE KEY UPDATE url = VALUES(url), payload = VALUES(payload)",
+                (
+                    event_id,
+                    url,
+                    json.dumps(payload),
+                    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f"),
+                ),
+            )
+            if cur.lastrowid:
+                return cur.lastrowid
+            if event_id is not None:
+                await cur.execute(
+                    "SELECT id FROM pending_webhook_events WHERE event_id = %s",
+                    (event_id,),
+                )
+                row = await cur.fetchone()
+                if row is not None:
+                    return int(row[0])
+            raise RuntimeError("Impossibile recuperare l'id dell'evento webhook")
+
+
+async def get_pending_events(pool: aiomysql.Pool) -> list[dict]:
+    """Restituisce tutti gli eventi non ancora consegnati, dal più vecchio al più recente."""
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                "SELECT id, url, payload, attempts, last_attempt_at "
+                "FROM pending_webhook_events "
+                "WHERE delivered_at IS NULL "
+                "ORDER BY id ASC"
+            )
+            rows = await cur.fetchall()
+    result = []
+    for row in rows:
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        result.append({**row, "payload": payload})
+    return result
+
+
+async def mark_event_delivered(pool: aiomysql.Pool, event_id: int) -> None:
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE pending_webhook_events SET delivered_at = %s WHERE id = %s",
+                (datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f"), event_id),
+            )
+
+
+async def increment_event_attempts(pool: aiomysql.Pool, event_id: int) -> None:
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE pending_webhook_events "
+                "SET attempts = attempts + 1, last_attempt_at = %s "
+                "WHERE id = %s",
+                (datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f"), event_id),
             )

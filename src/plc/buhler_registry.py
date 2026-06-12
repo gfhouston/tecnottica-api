@@ -6,11 +6,12 @@ from .opcua_driver import OpcUaDriver
 class BuhlerRegistry:
     """Registro centralizzato dei driver OPC-UA Buhler."""
 
-    def __init__(self) -> None:
+    def __init__(self, timeout: float = 10.0) -> None:
         self._drivers: dict[str, OpcUaDriver] = {
             machine_id: OpcUaDriver(
                 machine_id=cfg.machine_id,
                 url=cfg.url,
+                timeout=timeout,
             )
             for machine_id, cfg in BUHLER_MACHINES.items()
         }

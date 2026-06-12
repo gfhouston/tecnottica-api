@@ -1,7 +1,10 @@
+import asyncio
 import struct
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import snap7
+import snap7.type
 
 from .models import MachineState, MachineStatus
 
@@ -18,13 +21,15 @@ class Step7Driver:
     in caso di disconnessione. Tutte le operazioni sono thread-safe.
     """
 
-    def __init__(self, machine_id: str, ip: str, rack: int, slot: int) -> None:
+    def __init__(self, machine_id: str, ip: str, rack: int, slot: int, timeout: float = 10.0) -> None:
         self.machine_id = machine_id
         self.ip = ip
         self.rack = rack
         self.slot = slot
+        self.timeout = timeout
         self._client: snap7.Client | None = None
         self._lock = threading.Lock()
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"step7_{machine_id}")
 
     # ------------------------------------------------------------------
     # Public API
@@ -59,6 +64,22 @@ class Step7Driver:
         with self._lock:
             self._reset_client()
 
+    def close(self) -> None:
+        if self._lock.acquire(blocking=False):
+            try:
+                self._reset_client()
+            finally:
+                self._lock.release()
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    async def read_state_async(self) -> MachineState:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, self.read_state)
+
+    async def write_order_async(self, order: str) -> None:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self._executor, self.write_order, order)
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
@@ -66,6 +87,10 @@ class Step7Driver:
     def _ensure_connected(self) -> snap7.Client:
         if self._client is None:
             client = snap7.Client()
+            ms = int(self.timeout * 1000)
+            client.set_param(snap7.type.Parameter.PingTimeout, ms)
+            client.set_param(snap7.type.Parameter.SendTimeout, ms)
+            client.set_param(snap7.type.Parameter.RecvTimeout, ms)
             client.set_connection_type(1)  # 1 = PG (programming device)
             client.connect(self.ip, self.rack, self.slot)
             self._client = client

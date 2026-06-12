@@ -31,6 +31,11 @@ _NODES: dict[str, str] = {
 }
 
 _WRITE_NODE_ID = "ns=4;s=BMMC.CMD.Process_NextRecipeName"
+_REQUIRED_READ_NODES = {"next_recipe_name", "recipe_name", "step_name", "step_number", "process_start"}
+
+
+class OpcUaReadError(RuntimeError):
+    """Errore di lettura OPC-UA: almeno un nodo critico non e' affidabile."""
 
 
 class OpcUaDriver:
@@ -41,9 +46,10 @@ class OpcUaDriver:
     dopo ogni errore di comunicazione.
     """
 
-    def __init__(self, machine_id: str, url: str) -> None:
+    def __init__(self, machine_id: str, url: str, timeout: float = 10.0) -> None:
         self.machine_id = machine_id
         self.url = url
+        self.timeout = timeout
         self._client: Client | None = None
         self._lock = asyncio.Lock()
 
@@ -56,12 +62,26 @@ class OpcUaDriver:
             try:
                 await self._ensure_connected()
                 values: dict[str, Any] = {}
+                read_errors: dict[str, str] = {}
                 for key, node_id in _NODES.items():
                     node = self._client.get_node(node_id)
                     try:
                         values[key] = await node.read_value()
-                    except Exception:
+                    except Exception as exc:
                         values[key] = None
+                        read_errors[key] = f"{type(exc).__name__}: {exc}"
+                bad_required = [
+                    key
+                    for key in _REQUIRED_READ_NODES
+                    if key in read_errors or values.get(key) is None
+                ]
+                if bad_required:
+                    details = ", ".join(
+                        f"{key}={read_errors.get(key, 'None')}" for key in sorted(bad_required)
+                    )
+                    raise OpcUaReadError(
+                        f"Lettura OPC-UA incompleta su nodi critici: {details}"
+                    )
                 return _build_state(self.machine_id, values)
             except Exception:
                 await self._reset_client()
@@ -94,8 +114,8 @@ class OpcUaDriver:
 
     async def _ensure_connected(self) -> None:
         if self._client is None:
-            client = Client(url=self.url)
-            await client.connect()
+            client = Client(url=self.url, timeout=self.timeout)
+            await asyncio.wait_for(client.connect(), timeout=self.timeout)
             self._client = client
 
     async def _reset_client(self) -> None:

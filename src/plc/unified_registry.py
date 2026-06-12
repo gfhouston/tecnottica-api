@@ -25,9 +25,10 @@ class UnifiedRegistry:
     Espone anche i sub-registry separati per i monitor di venting.
     """
 
-    def __init__(self) -> None:
-        self._step7 = MachineRegistry()
-        self._buhler = BuhlerRegistry()
+    def __init__(self, plc_timeout: float = 10.0) -> None:
+        self._plc_timeout = plc_timeout
+        self._step7 = MachineRegistry(timeout=plc_timeout)
+        self._buhler = BuhlerRegistry(timeout=plc_timeout)
 
     @property
     def step7(self) -> MachineRegistry:
@@ -58,22 +59,27 @@ class UnifiedRegistry:
         return result
 
     async def read_state(self, machine_id: str) -> dict[str, Any]:
+        timeout = self._plc_timeout + 2.0
         if machine_id in MACHINES:
-            loop = asyncio.get_event_loop()
-            state = await loop.run_in_executor(
-                None, self._step7.get(machine_id).read_state
+            state = await asyncio.wait_for(
+                self._step7.get(machine_id).read_state_async(),
+                timeout=timeout,
             )
             return state.model_dump()
         if machine_id in BUHLER_MACHINES:
-            state = await self._buhler.get(machine_id).read_state()
+            state = await asyncio.wait_for(
+                self._buhler.get(machine_id).read_state(),
+                timeout=timeout,
+            )
             return state.model_dump()
         raise KeyError(machine_id)
 
     async def write_order(self, machine_id: str, order: str) -> dict[str, Any]:
+        timeout = self._plc_timeout + 2.0
         if machine_id in MACHINES:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None, self._step7.get(machine_id).write_order, order
+            await asyncio.wait_for(
+                self._step7.get(machine_id).write_order_async(order),
+                timeout=timeout,
             )
             return {
                 "success": True,
@@ -81,7 +87,10 @@ class UnifiedRegistry:
                 "order_part_program": order,
             }
         if machine_id in BUHLER_MACHINES:
-            confirmed = await self._buhler.get(machine_id).write_recipe(order)
+            confirmed = await asyncio.wait_for(
+                self._buhler.get(machine_id).write_recipe(order),
+                timeout=timeout,
+            )
             return {
                 "success": True,
                 "machine_id": machine_id,

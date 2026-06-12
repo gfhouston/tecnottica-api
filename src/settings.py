@@ -17,3 +17,14 @@ class EmailSettings:
     smtp_password: str
     from_name: str
     to_address: str
+
+    @property
+    def is_configured(self) -> bool:
+        return all(
+            [
+                self.smtp_host.strip(),
+                self.smtp_user.strip(),
+                self.smtp_password.strip(),
+                self.to_address.strip(),
+            ]
+        )

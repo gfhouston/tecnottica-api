@@ -20,6 +20,7 @@ from src.plc.buhler_monitor import BuhlerVentingMonitor
 from src.plc.models import WriteOrderRequest
 from src.plc.monitor import VentingMonitor
 from src.plc.unified_registry import UnifiedMachineInfo, UnifiedRegistry
+from src.plc.webhook_retry import WebhookRetryWorker
 
 load_dotenv()
 
@@ -43,7 +44,8 @@ async def lifespan(app: FastAPI):
         database=os.environ.get("DB_NAME", "tecnottica"),
     )
 
-    _unified = UnifiedRegistry()
+    plc_timeout = float(os.environ.get("PLC_TIMEOUT_SECONDS", "10"))
+    _unified = UnifiedRegistry(plc_timeout=plc_timeout)
 
     log_file = os.environ.get("VENTING_LOG_FILE", "/tmp/venting_events.log")
     webhook_url = os.environ.get("VENTING_WEBHOOK_URL") or None
@@ -51,14 +53,20 @@ async def lifespan(app: FastAPI):
         "SLACK_WEBHOOK_URL",
         "",
     )
-    email_settings = EmailSettings(
+    smtp_port_raw = os.environ.get("SMTP_PORT", "465")
+    try:
+        smtp_port = int(smtp_port_raw)
+    except ValueError:
+        smtp_port = 465
+    configured_email_settings = EmailSettings(
         smtp_host=os.environ.get("SMTP_HOST", ""),
-        smtp_port=int(os.environ.get("SMTP_PORT", "")),
+        smtp_port=smtp_port,
         smtp_user=os.environ.get("SMTP_USER", ""),
         smtp_password=os.environ.get("SMTP_PASSWORD", ""),
         from_name=os.environ.get("EMAIL_FROM_NAME", ""),
         to_address=os.environ.get("EMAIL_TO", ""),
     )
+    email_settings = configured_email_settings if configured_email_settings.is_configured else None
 
     monitor = VentingMonitor(
         registry=_unified.step7,
@@ -69,6 +77,7 @@ async def lifespan(app: FastAPI):
         slack_webhook_url=slack_webhook_url,
         email_settings=email_settings,
         trigger_mode=os.environ.get("OPTOTECH_END_OF_WORK_TRIGGER", "venting_stop"),
+        plc_timeout=plc_timeout,
     )
     monitor.start()
 
@@ -80,13 +89,22 @@ async def lifespan(app: FastAPI):
         db=_db,
         slack_webhook_url=slack_webhook_url,
         email_settings=email_settings,
+        plc_timeout=plc_timeout,
     )
     buhler_monitor.start()
+
+    retry_worker = WebhookRetryWorker(
+        pool=_db,
+        retry_interval=float(os.environ.get("WEBHOOK_RETRY_INTERVAL_SECONDS", "60")),
+        log_file=log_file,
+    )
+    retry_worker.start()
 
     yield
 
     await monitor.stop()
     await buhler_monitor.stop()
+    await retry_worker.stop()
     await _unified.disconnect_all()
     _db.close()
     await _db.wait_closed()

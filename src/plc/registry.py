@@ -6,13 +6,14 @@ from .step7_driver import Step7Driver
 class MachineRegistry:
     """Registro centralizzato dei driver PLC."""
 
-    def __init__(self) -> None:
+    def __init__(self, timeout: float = 10.0) -> None:
         self._drivers: dict[str, Step7Driver] = {
             machine_id: Step7Driver(
                 machine_id=cfg.machine_id,
                 ip=cfg.ip,
                 rack=cfg.rack,
                 slot=cfg.slot,
+                timeout=timeout,
             )
             for machine_id, cfg in MACHINES.items()
         }
@@ -37,4 +38,4 @@ class MachineRegistry:
 
     def disconnect_all(self) -> None:
         for driver in self._drivers.values():
-            driver.disconnect()
+            driver.close()
