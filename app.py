@@ -17,6 +17,7 @@ from src.local_auth import (
     verify_access_token,
 )
 from src.plc.buhler_monitor import BuhlerVentingMonitor
+from src.plc.buhler_sub_monitor import BuhlerSubscriptionMonitor
 from src.plc.models import WriteOrderRequest
 from src.plc.monitor import VentingMonitor
 from src.plc.unified_registry import UnifiedMachineInfo, UnifiedRegistry
@@ -81,16 +82,28 @@ async def lifespan(app: FastAPI):
     )
     monitor.start()
 
-    buhler_monitor = BuhlerVentingMonitor(
-        registry=_unified.buhler,
-        poll_interval=float(os.environ.get("BUHLER_VENTING_POLL_INTERVAL_SECONDS", "300")),
-        webhook_url=os.environ.get("BUHLER_VENTING_WEBHOOK_URL") or webhook_url,
-        log_file=log_file,
-        db=_db,
-        slack_webhook_url=slack_webhook_url,
-        email_settings=email_settings,
-        plc_timeout=plc_timeout,
-    )
+    buhler_monitor_mode = os.environ.get("BUHLER_MONITOR_MODE", "subscription").lower()
+    if buhler_monitor_mode == "polling":
+        buhler_monitor = BuhlerVentingMonitor(
+            registry=_unified.buhler,
+            poll_interval=float(os.environ.get("BUHLER_VENTING_POLL_INTERVAL_SECONDS", "300")),
+            webhook_url=os.environ.get("BUHLER_VENTING_WEBHOOK_URL") or webhook_url,
+            log_file=log_file,
+            db=_db,
+            slack_webhook_url=slack_webhook_url,
+            email_settings=email_settings,
+            plc_timeout=plc_timeout,
+        )
+    else:
+        buhler_monitor = BuhlerSubscriptionMonitor(
+            registry=_unified.buhler,
+            webhook_url=os.environ.get("BUHLER_VENTING_WEBHOOK_URL") or webhook_url,
+            log_file=log_file,
+            db=_db,
+            slack_webhook_url=slack_webhook_url,
+            email_settings=email_settings,
+            plc_timeout=plc_timeout,
+        )
     buhler_monitor.start()
 
     retry_worker = WebhookRetryWorker(
