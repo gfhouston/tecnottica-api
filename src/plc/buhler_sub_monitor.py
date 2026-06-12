@@ -113,6 +113,13 @@ class BuhlerSubscriptionMonitor:
         self._first_phase_end_time: dict[str, datetime] = {}
         self._venting_start_time: dict[str, datetime] = {}
 
+        # Con subscription ogni nodo notifica separatamente:
+        # "step_name→Venting" e "process_start→False" arrivano in tick distinti.
+        # _in_venting mantiene lo stato tra i due tick.
+        self._in_venting: dict[str, bool] = {}       # abbiamo visto step_name→"Venting"
+        self._was_running: dict[str, bool] = {}      # process_start è diventato True nel ciclo corrente
+        self._pending_last_step: dict[str, str] = {} # step precedente a Venting (per il log)
+
         # Stato errore connessione (per macchina)
         self._conn_error: dict[str, bool] = {}
         self._error_since: dict[str, datetime] = {}
@@ -238,41 +245,74 @@ class BuhlerSubscriptionMonitor:
     # ------------------------------------------------------------------
 
     async def _check(self, state: BuhlerState) -> None:
+        """
+        Con subscription ogni nodo arriva in una notifica separata, quindi
+        step_name→"Venting" e process_start→False non arrivano mai nello stesso
+        tick. Usiamo _was_running / _in_venting come flag inter-notifica:
+
+          process_start diventa True      → _was_running = True
+          step_name diventa "Venting"
+            (dopo step non-Venting, con _was_running)  → _in_venting = True
+          process_start diventa False
+            (con _in_venting)              → fire end-of-work
+
+        L'ordine delle due ultime notifiche è indifferente.
+        """
         mid = state.machine_id
         now = datetime.now(timezone.utc)
 
         prev_step_name = self._prev_step_name.get(mid)
-        prev_step_number = self._prev_step_number.get(mid)
         prev_running = self._prev_running.get(mid, False)
 
         step_name_changed = state.step_name != prev_step_name
-        step_number_changed = state.step_number != prev_step_number
 
+        # ── Nuovo ciclo di produzione ──────────────────────────────────────
         if state.process_start and not prev_running:
             self._job_start_time[mid] = now
             self._first_phase_end_time.pop(mid, None)
             self._venting_start_time.pop(mid, None)
+            self._in_venting.pop(mid, None)
+            self._pending_last_step.pop(mid, None)
 
-        if step_name_changed and step_number_changed:
+        # Memorizza che la macchina è stata in produzione in questo ciclo
+        if state.process_start:
+            self._was_running[mid] = True
+
+        # ── Cambio step name ───────────────────────────────────────────────
+        # Con subscription non richiediamo step_number_changed simultaneo:
+        # ogni notifica è già un cambiamento reale.
+        if step_name_changed and prev_step_name is not None:
             self._append_log(
-                f"PHASE_CHANGE | machine={mid} | step_num={state.step_number}"
-                f" | step={state.step_name!r} | process_start={state.process_start}"
+                f"PHASE_CHANGE | machine={mid} | step={state.step_name!r}"
+                f" | process_start={state.process_start}"
             )
-            if prev_step_name is not None:
-                if mid not in self._first_phase_end_time:
-                    self._first_phase_end_time[mid] = now
-                if state.step_name == "Venting" and mid not in self._venting_start_time:
-                    self._venting_start_time[mid] = now
+            if mid not in self._first_phase_end_time:
+                self._first_phase_end_time[mid] = now
 
+        # ── Ingresso in Venting ────────────────────────────────────────────
         if (
-            prev_step_name is not None
+            step_name_changed
+            and prev_step_name is not None
             and prev_step_name != "Venting"
-            and prev_running
             and state.step_name == "Venting"
-            and step_number_changed
+            and self._was_running.get(mid)
+        ):
+            self._in_venting[mid] = True
+            self._pending_last_step.setdefault(mid, prev_step_name)
+            if mid not in self._venting_start_time:
+                self._venting_start_time[mid] = now
+
+        # ── Fine lavoro: Venting + process_start=False ────────────────────
+        # Si scatena su whichever delle due notifiche arriva per seconda.
+        if (
+            self._in_venting.get(mid)
+            and self._was_running.get(mid)
             and not state.process_start
         ):
-            await self._fire(state, prev_step_name)
+            last_step = self._pending_last_step.pop(mid, prev_step_name or "")
+            self._in_venting.pop(mid, None)
+            self._was_running.pop(mid, None)
+            await self._fire(state, last_step)
 
         self._prev_step_name[mid] = state.step_name
         self._prev_step_number[mid] = state.step_number
