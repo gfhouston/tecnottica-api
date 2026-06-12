@@ -289,6 +289,16 @@ class BuhlerVentingMonitor:
             f" | recipe={state.recipe_name!r}"
         )
 
+        # Reset Process_NextRecipeName sul PLC (BMMC.CMD.Process_NextRecipeName)
+        try:
+            await asyncio.wait_for(
+                self._registry.get(mid).write_recipe(""),
+                timeout=self._plc_timeout + 2.0,
+            )
+            self._append_log(f"PLC_RESET_OK | machine={mid} | next_recipe_name cleared")
+        except Exception as exc:
+            self._append_log(f"PLC_RESET_ERR | machine={mid} | {type(exc).__name__}: {exc}")
+
         if self._webhook_url:
             await self._deliver_webhook(payload, state.machine_id)
 

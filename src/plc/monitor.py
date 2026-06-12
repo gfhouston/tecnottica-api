@@ -302,6 +302,17 @@ class VentingMonitor:
             f"| status={state.machine_status.value} | alarm={state.alarm_code}"
         )
 
+        # Reset ORDER_PART_PROGRAM sul PLC (DB10 offset 0, 50 char)
+        try:
+            loop = asyncio.get_event_loop()
+            await asyncio.wait_for(
+                loop.run_in_executor(None, self._registry.get(mid).write_order, ""),
+                timeout=self._plc_timeout + 2.0,
+            )
+            self._append_log(f"PLC_RESET_OK | machine={mid} | order_part_program cleared")
+        except Exception as exc:
+            self._append_log(f"PLC_RESET_ERR | machine={mid} | {type(exc).__name__}: {exc}")
+
         if self._webhook_url:
             await self._deliver_webhook(payload, state.machine_id)
 
