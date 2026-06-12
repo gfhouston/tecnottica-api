@@ -273,6 +273,11 @@ class BuhlerSubscriptionMonitor:
             self._venting_start_time.pop(mid, None)
             self._in_venting.pop(mid, None)
             self._pending_last_step.pop(mid, None)
+            await self._notify_slack(
+                f"*Inizio lavorazione Buhler* | `{mid}`\n"
+                f"Ricetta: `{state.next_recipe_name}`",
+                machine_id=mid,
+            )
 
         # Memorizza che la macchina è stata in produzione in questo ciclo
         if state.process_start:

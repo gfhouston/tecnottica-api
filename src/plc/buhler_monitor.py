@@ -209,6 +209,11 @@ class BuhlerVentingMonitor:
             self._job_start_time[mid] = now
             self._first_phase_end_time.pop(mid, None)
             self._venting_start_time.pop(mid, None)
+            await self._notify_slack(
+                f"*Inizio lavorazione Buhler* | `{mid}`\n"
+                f"Ricetta: `{state.next_recipe_name}`",
+                machine_id=mid,
+            )
 
         # Cambio fase reale: step_number E step_name cambiano contemporaneamente
         if step_name_changed and step_number_changed:

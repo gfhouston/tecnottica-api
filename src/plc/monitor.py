@@ -223,6 +223,11 @@ class VentingMonitor:
             self._job_start_time[mid] = now
             self._first_phase_end_time.pop(mid, None)
             self._venting_start_time.pop(mid, None)
+            await self._notify_slack(
+                f"*Inizio lavorazione Optotech* | `{mid}`\n"
+                f"Programma: `{state.order_part_program}`",
+                machine_id=mid,
+            )
 
         phase_changed = state.working_phase != self._last_phase.get(mid)
         had_previous_phase = self._last_phase.get(mid) is not None
