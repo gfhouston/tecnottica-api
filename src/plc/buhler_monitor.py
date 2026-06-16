@@ -81,6 +81,7 @@ class BuhlerVentingMonitor:
         self._error_since: dict[str, datetime] = {}
         self._last_error_notified: dict[str, datetime] = {}
         self._pre_error_running: dict[str, bool] = {}
+        self._pending_recipe_reset: dict[str, bool] = {}
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name="buhler_venting_monitor")
@@ -197,6 +198,17 @@ class BuhlerVentingMonitor:
         mid = state.machine_id
         now = datetime.now(timezone.utc)
 
+        if self._pending_recipe_reset.get(mid):
+            try:
+                await asyncio.wait_for(
+                    self._registry.get(mid).write_recipe(""),
+                    timeout=self._plc_timeout + 2.0,
+                )
+                self._pending_recipe_reset.pop(mid, None)
+                self._append_log(f"PLC_RESET_RETRY_OK | machine={mid} | next_recipe_name cleared")
+            except Exception as exc:
+                self._append_log(f"PLC_RESET_RETRY_ERR | machine={mid} | {type(exc).__name__}: {exc}")
+
         prev_step_name = self._prev_step_name.get(mid)
         prev_step_number = self._prev_step_number.get(mid)
         prev_running = self._prev_running.get(mid, False)
@@ -303,6 +315,7 @@ class BuhlerVentingMonitor:
             self._append_log(f"PLC_RESET_OK | machine={mid} | next_recipe_name cleared")
         except Exception as exc:
             self._append_log(f"PLC_RESET_ERR | machine={mid} | {type(exc).__name__}: {exc}")
+            self._pending_recipe_reset[mid] = True
 
         if self._webhook_url:
             await self._deliver_webhook(payload, state.machine_id)

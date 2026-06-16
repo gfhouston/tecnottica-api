@@ -223,6 +223,7 @@ class VentingMonitor:
             self._job_start_time[mid] = now
             self._first_phase_end_time.pop(mid, None)
             self._venting_start_time.pop(mid, None)
+            self._last_phase.pop(mid, None)  # evita che il cambio fase del tick di avvio azzeri t_first
             await self._notify_slack(
                 f"*Inizio lavorazione Optotech* | `{mid}`\n"
                 f"Programma: `{state.order_part_program}`",
