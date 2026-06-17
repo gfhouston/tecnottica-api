@@ -61,9 +61,11 @@ class BuhlerVentingMonitor:
         slack_webhook_url: str | None = None,
         email_settings: EmailSettings | None = None,
         plc_timeout: float = 10.0,
+        end_debounce: float = 180.0,
     ) -> None:
         self._registry = registry
         self._poll_interval = poll_interval
+        self._end_debounce = end_debounce
         self._webhook_url = webhook_url
         self._log_file = log_file
         self._db = db
@@ -75,6 +77,7 @@ class BuhlerVentingMonitor:
         self._job_start_time: dict[str, datetime] = {}
         self._first_phase_end_time: dict[str, datetime] = {}
         self._venting_start_time: dict[str, datetime] = {}
+        self._pending_last_step: dict[str, str] = {}
         self._plc_timeout = plc_timeout
         self._task: asyncio.Task | None = None
         self._polling_error: dict[str, bool] = {}
@@ -82,6 +85,9 @@ class BuhlerVentingMonitor:
         self._last_error_notified: dict[str, datetime] = {}
         self._pre_error_running: dict[str, bool] = {}
         self._pending_recipe_reset: dict[str, bool] = {}
+        # Fine lavoro in attesa di conferma (debounce su Process_Start=0):
+        # {mid: {time, state, last_step, recipe}}. Vedi _check.
+        self._pending_end: dict[str, dict] = {}
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run(), name="buhler_venting_monitor")
@@ -165,22 +171,27 @@ class BuhlerVentingMonitor:
         base_body = f"Il PLC Buhler è tornato raggiungibile.\n\nMacchina: {mid}\nAssenza: {elapsed}\n"
 
         if was_running and not state.process_start:
+            # Fine lavoro avvenuta durante il blackout (durata >> debounce): è
+            # confermata, la emettiamo subito. Azzeriamo prev_running così il
+            # blocco "Fine lavoro" di _check non rischedula un debounce.
+            last_step = self._pending_last_step.pop(mid, self._prev_step_name.get(mid) or "")
+            self._prev_running[mid] = False
             self._append_log(
-                f"MISSED_EVENT? | machine={mid} | era in produzione prima del blackout, ora è ferma"
+                f"MISSED_EVENT_RECOVERED | machine={mid} | fine lavoro durante blackout di {elapsed}"
             )
             await self._notify_slack(
-                base_msg + "\n*ATTENZIONE*: la macchina era in produzione prima del blackout "
-                "ed è ora ferma. Un evento di fine lavoro potrebbe essere andato perso.",
+                base_msg + "\n*Fine lavoro avvenuta durante il blackout*: viene registrata ora.",
                 machine_id=mid,
             )
             await self._notify_email(
-                subject=f"PLC tornato online | {mid} | POSSIBILE EVENTO PERSO",
+                subject=f"PLC tornato online | {mid} | FINE LAVORO RECUPERATA",
                 body=base_body + (
-                    "\nATTENZIONE: la macchina era in produzione prima del blackout ed è ora ferma.\n"
-                    "Un evento di fine lavoro potrebbe essere andato perso.\n"
+                    "\nLa macchina era in produzione prima del blackout ed è ora ferma.\n"
+                    "La fine lavoro avvenuta durante il blackout viene registrata ora.\n"
                 ),
                 machine_id=mid,
             )
+            await self._fire(state, last_step)
         else:
             await self._notify_slack(base_msg, machine_id=mid)
             await self._notify_email(
@@ -216,15 +227,50 @@ class BuhlerVentingMonitor:
         step_name_changed = state.step_name != prev_step_name
         step_number_changed = state.step_number != prev_step_number
 
+        # ── Risoluzione fine lavoro in attesa di conferma (debounce) ───────
+        # Process_Start può fare tonfi transitori a metà lavoro e ripartire con
+        # la stessa ricetta: confermiamo la fine solo se resta a 0 per
+        # _end_debounce secondi (scatto immediato se riparte ricetta diversa).
+        glitch_resume = False
+        pending = self._pending_end.get(mid)
+        if pending is not None:
+            if state.process_start:
+                self._pending_end.pop(mid, None)
+                if state.recipe_name == pending["recipe"]:
+                    glitch_resume = True
+                    self._append_log(
+                        f"END_CANCELLED | machine={mid} | tonfo transitorio Process_Start"
+                        f" (ricetta invariata {state.recipe_name!r})"
+                    )
+                else:
+                    self._append_log(
+                        f"END_CONFIRMED | machine={mid} | ripartenza con ricetta diversa"
+                    )
+                    await self._fire(pending["state"], pending["last_step"])
+            elif (now - pending["time"]).total_seconds() >= self._end_debounce:
+                self._pending_end.pop(mid, None)
+                self._append_log(
+                    f"END_CONFIRMED | machine={mid} | Process_Start fermo da {int(self._end_debounce)}s"
+                )
+                await self._fire(pending["state"], pending["last_step"])
+
         # Avvio macchina (o prima osservazione come attiva)
-        if state.process_start and not prev_running:
+        if state.process_start and not prev_running and not glitch_resume:
             self._job_start_time[mid] = now
             self._first_phase_end_time.pop(mid, None)
             self._venting_start_time.pop(mid, None)
+            self._pending_last_step.pop(mid, None)
             await self._notify_slack(
                 f"*Inizio lavorazione Buhler* | `{mid}`\n"
                 f"Ricetta: `{state.next_recipe_name}`",
                 machine_id=mid,
+            )
+
+        # Traccia i fronti di process_start (utile per la diagnosi).
+        if state.process_start != prev_running:
+            self._append_log(
+                f"PROCESS_START_CHANGE | machine={mid}"
+                f" | process_start={state.process_start} | step={state.step_name!r}"
             )
 
         # Cambio fase reale: step_number E step_name cambiano contemporaneamente
@@ -237,19 +283,26 @@ class BuhlerVentingMonitor:
             if prev_step_name is not None:
                 if mid not in self._first_phase_end_time:
                     self._first_phase_end_time[mid] = now
-                if state.step_name == "Venting" and mid not in self._venting_start_time:
-                    self._venting_start_time[mid] = now
+                if state.step_name == "Venting":
+                    if mid not in self._venting_start_time:
+                        self._venting_start_time[mid] = now
+                    self._pending_last_step.setdefault(mid, prev_step_name)
 
-        # Fine lavoro: da fase != Venting con process_start=True → Venting (step_name E step_number cambiano) con process_start=False
-        if (
-            prev_step_name is not None
-            and prev_step_name != "Venting"
-            and prev_running
-            and state.step_name == "Venting"
-            and step_number_changed
-            and not state.process_start
-        ):
-            await self._fire(state, prev_step_name)
+        # Fine lavoro: process_start True→False dopo produzione. Segnale universale,
+        # indipendente dalla ricetta. Non scatta subito: mette la fine in attesa
+        # di conferma (debounce), risolta sopra ai poll successivi.
+        if prev_running and not state.process_start and mid not in self._pending_end:
+            last_step = self._pending_last_step.pop(mid, prev_step_name or "")
+            self._pending_end[mid] = {
+                "time": now,
+                "state": state,
+                "last_step": last_step,
+                "recipe": state.recipe_name,
+            }
+            self._append_log(
+                f"END_PENDING | machine={mid} | conferma fra {int(self._end_debounce)}s"
+                f" | last_step={last_step!r}"
+            )
 
         self._prev_step_name[mid] = state.step_name
         self._prev_step_number[mid] = state.step_number

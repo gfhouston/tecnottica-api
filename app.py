@@ -93,6 +93,7 @@ async def lifespan(app: FastAPI):
             slack_webhook_url=slack_webhook_url,
             email_settings=email_settings,
             plc_timeout=plc_timeout,
+            end_debounce=float(os.environ.get("BUHLER_END_DEBOUNCE_SECONDS", "180")),
         )
     else:
         buhler_monitor = BuhlerSubscriptionMonitor(
@@ -103,6 +104,7 @@ async def lifespan(app: FastAPI):
             slack_webhook_url=slack_webhook_url,
             email_settings=email_settings,
             plc_timeout=plc_timeout,
+            end_debounce=float(os.environ.get("BUHLER_END_DEBOUNCE_SECONDS", "180")),
         )
     buhler_monitor.start()
 

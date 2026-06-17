@@ -78,10 +78,11 @@ class BuhlerSubscriptionMonitor:
     Subscription al server OPC-UA. Invece di un polling periodico,
     riceve notifiche push ogni volta che un tag cambia valore.
 
-    La logica di rilevamento fine-lavoro è identica a BuhlerVentingMonitor:
-      fase != "Venting" + Process_Start == True
-      →
-      fase == "Venting" + Process_Start == False  (step_number cambia)
+    Fine lavoro = Process_Start passa da True a False dopo che la macchina
+    è stata in produzione. È il segnale universale, indipendente dalla
+    ricetta: le ricette con fase "Venting" abbassano Process_Start al
+    termine del Venting, le altre (es. APC_APS_*, che non passano da uno
+    step chiamato "Venting") lo abbassano direttamente.
     """
 
     def __init__(
@@ -93,6 +94,7 @@ class BuhlerSubscriptionMonitor:
         slack_webhook_url: str | None = None,
         email_settings: EmailSettings | None = None,
         plc_timeout: float = 10.0,
+        end_debounce: float = 180.0,
     ) -> None:
         self._registry = registry
         self._webhook_url = webhook_url
@@ -101,6 +103,11 @@ class BuhlerSubscriptionMonitor:
         self._slack_webhook_url = slack_webhook_url
         self._email_settings = email_settings
         self._plc_timeout = plc_timeout
+        # Debounce fine lavoro: Process_Start può fare tonfi transitori a metà
+        # lavoro (spec. durante Heating) e ripartire entro 1-3 min con la stessa
+        # ricetta. La fine lavoro viene confermata solo se Process_Start resta a
+        # 0 per questo tempo (scatto immediato se riparte una ricetta diversa).
+        self._end_debounce = end_debounce
 
         # Cache valori correnti: {machine_id: {key: value}}
         self._cache: dict[str, dict[str, Any]] = {}
@@ -113,18 +120,23 @@ class BuhlerSubscriptionMonitor:
         self._first_phase_end_time: dict[str, datetime] = {}
         self._venting_start_time: dict[str, datetime] = {}
 
-        # Con subscription ogni nodo notifica separatamente:
-        # "step_name→Venting" e "process_start→False" arrivano in tick distinti.
-        # _in_venting mantiene lo stato tra i due tick.
-        self._in_venting: dict[str, bool] = {}       # abbiamo visto step_name→"Venting"
-        self._was_running: dict[str, bool] = {}      # process_start è diventato True nel ciclo corrente
-        self._pending_last_step: dict[str, str] = {} # step precedente a Venting (per il log)
+        # _was_running: la macchina ha visto process_start=True nel ciclo corrente.
+        # Serve a distinguere il fronte di fine lavoro (True→False) da una
+        # macchina osservata già ferma (es. subito dopo una riconnessione).
+        self._was_running: dict[str, bool] = {}
+        # step "reale" precedente al Venting, usato come last_step nel log/evento.
+        self._pending_last_step: dict[str, str] = {}
+        # Fine lavoro in attesa di conferma (debounce): {mid: {state, last_step, recipe, task}}.
+        self._pending_end: dict[str, dict] = {}
 
         # Stato errore connessione (per macchina)
         self._conn_error: dict[str, bool] = {}
         self._error_since: dict[str, datetime] = {}
         self._last_error_notified: dict[str, datetime] = {}
         self._pre_error_running: dict[str, bool] = {}
+        # Riconciliazione post-riconnessione: differita al primo stato fresco
+        # (la subscription clona la cache, quindi serve aspettare i valori nuovi).
+        self._recovery_pending: dict[str, bool] = {}
 
         self._tasks: dict[str, asyncio.Task] = {}
 
@@ -142,6 +154,9 @@ class BuhlerSubscriptionMonitor:
             self._tasks[cfg.machine_id] = task
 
     async def stop(self) -> None:
+        for pending in self._pending_end.values():
+            pending["task"].cancel()
+        self._pending_end.clear()
         for task in self._tasks.values():
             task.cancel()
         results = await asyncio.gather(*self._tasks.values(), return_exceptions=True)
@@ -178,7 +193,15 @@ class BuhlerSubscriptionMonitor:
             await subscription.subscribe_data_change(nodes)
 
             if self._conn_error.get(mid):
-                await self._on_conn_restored(mid)
+                error_since = self._error_since.get(mid)
+                elapsed = (
+                    _fmt_sec((datetime.now(timezone.utc) - error_since).total_seconds())
+                    if error_since else "?"
+                )
+                self._append_log(f"CONN_OK | machine={mid} | ripristinato dopo {elapsed}")
+                # La riconciliazione (notifica online + eventuale fine lavoro
+                # persa) avviene in _check, al primo stato fresco.
+                self._recovery_pending[mid] = True
 
             self._append_log(f"SUB_CONNECTED | machine={mid} | url={url}")
 
@@ -246,37 +269,73 @@ class BuhlerSubscriptionMonitor:
 
     async def _check(self, state: BuhlerState) -> None:
         """
-        Con subscription ogni nodo arriva in una notifica separata, quindi
-        step_name→"Venting" e process_start→False non arrivano mai nello stesso
-        tick. Usiamo _was_running / _in_venting come flag inter-notifica:
+        Con subscription ogni nodo arriva in una notifica separata.
+        La fine lavoro è il fronte process_start True→False dopo che la
+        macchina è stata in produzione (_was_running):
 
-          process_start diventa True      → _was_running = True
-          step_name diventa "Venting"
-            (dopo step non-Venting, con _was_running)  → _in_venting = True
-          process_start diventa False
-            (con _in_venting)              → fire end-of-work
+          process_start diventa True   → _was_running = True
+          process_start diventa False  → fire end-of-work
 
-        L'ordine delle due ultime notifiche è indifferente.
+        Lo step "Venting", quando presente, serve solo a calcolare i tempi
+        e a ricavare last_step; non è più un requisito per lo scatto
+        (alcune ricette non passano da uno step chiamato "Venting").
         """
         mid = state.machine_id
         now = datetime.now(timezone.utc)
+
+        # Primo stato fresco dopo una riconnessione: notifica "online" e, se la
+        # macchina si è fermata durante il blackout, segnala il recupero. L'evento
+        # END_OF_WORK vero e proprio viene emesso dal blocco "Fine lavoro" qui sotto
+        # (_was_running sopravvive alla riconnessione).
+        if self._recovery_pending.pop(mid, False):
+            await self._reconcile_recovery(mid, state)
 
         prev_step_name = self._prev_step_name.get(mid)
         prev_running = self._prev_running.get(mid, False)
 
         step_name_changed = state.step_name != prev_step_name
 
-        # ── Nuovo ciclo di produzione ──────────────────────────────────────
+        # ── Process_Start torna True: nuovo ciclo o ripresa da tonfo ───────
+        glitch_resume = False
         if state.process_start and not prev_running:
-            self._job_start_time[mid] = now
-            self._first_phase_end_time.pop(mid, None)
-            self._venting_start_time.pop(mid, None)
-            self._in_venting.pop(mid, None)
-            self._pending_last_step.pop(mid, None)
-            await self._notify_slack(
-                f"*Inizio lavorazione Buhler* | `{mid}`\n"
-                f"Ricetta: `{state.next_recipe_name}`",
-                machine_id=mid,
+            pending = self._pending_end.pop(mid, None)
+            if pending is not None:
+                # C'era una fine lavoro in attesa di conferma e la macchina
+                # è ripartita entro il debounce.
+                pending["task"].cancel()
+                if state.recipe_name == pending["recipe"]:
+                    # Stessa ricetta → era solo un tonfo transitorio: annulla.
+                    glitch_resume = True
+                    self._append_log(
+                        f"END_CANCELLED | machine={mid} | tonfo transitorio Process_Start"
+                        f" (ricetta invariata {state.recipe_name!r})"
+                    )
+                else:
+                    # Ricetta diversa → il lavoro precedente è finito davvero:
+                    # emettilo ora, poi tratta questo come nuovo ciclo.
+                    self._was_running.pop(mid, None)
+                    self._append_log(
+                        f"END_CONFIRMED | machine={mid} | ripartenza con ricetta diversa"
+                    )
+                    await self._fire(pending["state"], pending["last_step"])
+
+            if not glitch_resume:
+                self._job_start_time[mid] = now
+                self._first_phase_end_time.pop(mid, None)
+                self._venting_start_time.pop(mid, None)
+                self._pending_last_step.pop(mid, None)
+                await self._notify_slack(
+                    f"*Inizio lavorazione Buhler* | `{mid}`\n"
+                    f"Ricetta: `{state.next_recipe_name}`",
+                    machine_id=mid,
+                )
+
+        # Traccia i fronti di process_start: prima erano invisibili nel log se
+        # non accompagnati da un cambio step contestuale. Utile per la diagnosi.
+        if state.process_start != prev_running:
+            self._append_log(
+                f"PROCESS_START_CHANGE | machine={mid}"
+                f" | process_start={state.process_start} | step={state.step_name!r}"
             )
 
         # Memorizza che la macchina è stata in produzione in questo ciclo
@@ -294,7 +353,9 @@ class BuhlerSubscriptionMonitor:
             if mid not in self._first_phase_end_time:
                 self._first_phase_end_time[mid] = now
 
-        # ── Ingresso in Venting ────────────────────────────────────────────
+        # ── Ingresso in Venting (solo tempi / last_step, NON è un gate) ────
+        # Alcune ricette (es. APC_APS_*) non passano da uno step "Venting":
+        # per loro questo blocco semplicemente non scatta.
         if (
             step_name_changed
             and prev_step_name is not None
@@ -302,26 +363,57 @@ class BuhlerSubscriptionMonitor:
             and state.step_name == "Venting"
             and self._was_running.get(mid)
         ):
-            self._in_venting[mid] = True
             self._pending_last_step.setdefault(mid, prev_step_name)
             if mid not in self._venting_start_time:
                 self._venting_start_time[mid] = now
 
-        # ── Fine lavoro: Venting + process_start=False ────────────────────
-        # Si scatena su whichever delle due notifiche arriva per seconda.
+        # ── Fine lavoro: process_start True→False dopo produzione ──────────
+        # Segnale universale di fine lavoro, indipendente dalla ricetta. Non
+        # scatta subito: programma una conferma fra _end_debounce secondi, per
+        # ignorare i tonfi transitori di Process_Start (vedi _debounced_end).
         if (
-            self._in_venting.get(mid)
-            and self._was_running.get(mid)
+            self._was_running.get(mid)
             and not state.process_start
+            and mid not in self._pending_end
         ):
             last_step = self._pending_last_step.pop(mid, prev_step_name or "")
-            self._in_venting.pop(mid, None)
-            self._was_running.pop(mid, None)
-            await self._fire(state, last_step)
+            task = asyncio.create_task(
+                self._debounced_end(mid), name=f"buhler_end_{mid}"
+            )
+            self._pending_end[mid] = {
+                "state": state,
+                "last_step": last_step,
+                "recipe": state.recipe_name,
+                "task": task,
+            }
+            self._append_log(
+                f"END_PENDING | machine={mid} | conferma fra {int(self._end_debounce)}s"
+                f" | last_step={last_step!r}"
+            )
 
         self._prev_step_name[mid] = state.step_name
         self._prev_step_number[mid] = state.step_number
         self._prev_running[mid] = state.process_start
+
+    async def _debounced_end(self, mid: str) -> None:
+        """
+        Attende _end_debounce secondi e poi conferma la fine lavoro, a meno che
+        nel frattempo la macchina non sia ripartita: in quel caso il task viene
+        cancellato da _check (tonfo transitorio) oppure la fine viene emessa
+        subito (ripartenza con ricetta diversa).
+        """
+        try:
+            await asyncio.sleep(self._end_debounce)
+        except asyncio.CancelledError:
+            return
+        pending = self._pending_end.pop(mid, None)
+        if pending is None:
+            return
+        self._was_running.pop(mid, None)
+        self._append_log(
+            f"END_CONFIRMED | machine={mid} | Process_Start fermo da {int(self._end_debounce)}s"
+        )
+        await self._fire(pending["state"], pending["last_step"])
 
     async def _fire(self, state: BuhlerState, last_work_step: str) -> None:
         fire_dt = datetime.now(timezone.utc)
@@ -455,37 +547,47 @@ class BuhlerSubscriptionMonitor:
                 )
                 self._last_error_notified[mid] = now
 
-    async def _on_conn_restored(self, mid: str) -> None:
+    async def _reconcile_recovery(self, mid: str, state: BuhlerState) -> None:
+        """
+        Riconciliazione al primo stato fresco dopo una riconnessione.
+
+        Notifica che il PLC è tornato online e, se la macchina era in
+        produzione prima del blackout ed è ora ferma (process_start=False),
+        segnala che la fine lavoro avvenuta durante il blackout viene
+        registrata: l'evento END_OF_WORK + webhook/DB è poi emesso dal blocco
+        "Fine lavoro" di _check, che gira subito dopo con questo stesso stato.
+        """
         error_since = self._error_since.get(mid)
         elapsed = (
             _fmt_sec((datetime.now(timezone.utc) - error_since).total_seconds())
             if error_since else "?"
         )
         was_running = self._pre_error_running.get(mid, False)
-        current_running = self._prev_running.get(mid, False)
-
-        self._append_log(f"CONN_OK | machine={mid} | ripristinato dopo {elapsed}")
 
         base_msg = f"*PLC Buhler tornato online* | `{mid}` | assente da {elapsed}"
         base_body = f"Il PLC Buhler è tornato raggiungibile.\n\nMacchina: {mid}\nAssenza: {elapsed}\n"
 
-        if was_running and not current_running:
+        if was_running and not state.process_start:
+            # Lo stop è avvenuto durante il blackout (durata >> debounce): è
+            # confermato, lo emettiamo subito senza attendere il debounce.
+            last_step = self._pending_last_step.pop(mid, self._prev_step_name.get(mid) or "")
+            self._was_running.pop(mid, None)
             self._append_log(
-                f"MISSED_EVENT? | machine={mid} | era in produzione prima del blackout, ora è ferma"
+                f"MISSED_EVENT_RECOVERED | machine={mid} | fine lavoro durante blackout di {elapsed}"
             )
             await self._notify_slack(
-                base_msg + "\n*ATTENZIONE*: la macchina era in produzione prima del blackout "
-                "ed è ora ferma. Un evento di fine lavoro potrebbe essere andato perso.",
+                base_msg + "\n*Fine lavoro avvenuta durante il blackout*: viene registrata ora.",
                 machine_id=mid,
             )
             await self._notify_email(
-                subject=f"PLC tornato online | {mid} | POSSIBILE EVENTO PERSO",
+                subject=f"PLC tornato online | {mid} | FINE LAVORO RECUPERATA",
                 body=base_body + (
-                    "\nATTENZIONE: la macchina era in produzione prima del blackout ed è ora ferma.\n"
-                    "Un evento di fine lavoro potrebbe essere andato perso.\n"
+                    "\nLa macchina era in produzione prima del blackout ed è ora ferma.\n"
+                    "La fine lavoro avvenuta durante il blackout viene registrata ora.\n"
                 ),
                 machine_id=mid,
             )
+            await self._fire(state, last_step)
         else:
             await self._notify_slack(base_msg, machine_id=mid)
             await self._notify_email(
