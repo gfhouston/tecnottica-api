@@ -4,6 +4,7 @@ import re
 import smtplib
 import ssl
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from email.mime.text import MIMEText
 from typing import TYPE_CHECKING
@@ -17,7 +18,12 @@ from .registry import MachineRegistry
 if TYPE_CHECKING:
     import aiomysql
 
-_VENTING_RE = re.compile(r"Venting\s*\(\d+\s*of\s*\d+\)", re.IGNORECASE)
+# Il PLC Optotech corrompe ~30% delle letture stringa DB10: i primi 4 byte di
+# "Venting" diventano garbage/null (es. "\0\0?Jing (10 of 10)" → parser "?Jing (10 of 10)").
+# Ancoriamo quindi al suffisso "ing (N of N)", che nei dati storici identifica
+# univocamente il Venting (Vacuum è sempre "1 of N", nessuna fase legittima non-Venting
+# termina in "ing (N of N)"): zero falsi positivi, recupera le letture corrotte.
+_VENTING_RE = re.compile(r"ing\s*\(\s*\d+\s*of\s*\d+\s*\)", re.IGNORECASE)
 _ACTIVE_STATUSES = {MachineStatus.RUNNING, MachineStatus.RUNNING_PAUSED}
 _ERROR_NOTIFY_COOLDOWN = 1800  # secondi tra notifiche ripetute durante outage prolungato
 
@@ -82,6 +88,8 @@ class VentingMonitor:
         self._trigger_mode = trigger_mode
         self._was_venting_active: dict[str, bool] = {}
         self._was_working_active: dict[str, bool] = {}
+        self._venting_seen: dict[str, bool] = {}  # latch: Venting visto in QUALSIASI tick del job
+        self._job_orders: dict[str, Counter] = {}  # frequenze order_part_program durante il job
         self._last_phase: dict[str, str] = {}
         self._job_start_time: dict[str, datetime] = {}
         self._first_phase_end_time: dict[str, datetime] = {}
@@ -223,6 +231,8 @@ class VentingMonitor:
             self._job_start_time[mid] = now
             self._first_phase_end_time.pop(mid, None)
             self._venting_start_time.pop(mid, None)
+            self._venting_seen.pop(mid, None)
+            self._job_orders.pop(mid, None)
             self._last_phase.pop(mid, None)  # evita che il cambio fase del tick di avvio azzeri t_first
             await self._notify_slack(
                 f"*Inizio lavorazione Optotech* | `{mid}`\n"
@@ -245,9 +255,21 @@ class VentingMonitor:
                     self._venting_start_time[mid] = now
             self._last_phase[mid] = state.working_phase
 
+        # Latch + storico ordini durante il job attivo (robustezza alla corruzione
+        # delle stringhe DB10: un singolo tick corrotto non deve far perdere l'evento
+        # né il collegamento alla commessa).
+        if is_active:
+            if is_venting:
+                self._venting_seen[mid] = True
+            order = state.order_part_program.strip()
+            if order:
+                self._job_orders.setdefault(mid, Counter())[order] += 1
+
         if self._trigger_mode == TRIGGER_VENTING_STOP:
-            # Fine lavoro: Venting running → macchina si ferma
-            if was_venting_active and not is_active:
+            # Fine lavoro: Venting visto durante il job → macchina si ferma.
+            # Usiamo il latch (non solo il tick precedente) così una lettura Venting
+            # corrotta all'ultimo istante non fa saltare la rilevazione.
+            if self._venting_seen.get(mid, False) and not is_active:
                 await self._fire(state)
         else:
             # Fine lavoro: fase non-Venting attiva → fase Venting ancora attiva
@@ -261,6 +283,12 @@ class VentingMonitor:
         fire_dt = datetime.now(timezone.utc)
         ts = fire_dt.isoformat()
         mid = state.machine_id
+
+        # order_part_program robusto alla corruzione: l'istante di stop può avere la
+        # stringa corrotta (primi 4 byte garbage), il che farebbe fallire il lookup ordini.
+        # Usiamo il valore più frequente osservato durante il job (il valore pulito domina
+        # sulle varianti corrotte ~30%), con fallback al valore dell'istante di stop.
+        order_part_program = self._resolve_job_order(mid, state.order_part_program)
 
         # Calcolo tempi di lavorazione
         job_start = self._job_start_time.get(mid)
@@ -276,19 +304,21 @@ class VentingMonitor:
                 "t_working_seconds": max(0.0, t_working.total_seconds()),
                 "t_venting_seconds": max(0.0, t_venting.total_seconds()),
             }
-        # Reset timer per il prossimo ciclo
+        # Reset timer/stato per il prossimo ciclo
         self._job_start_time.pop(mid, None)
         self._first_phase_end_time.pop(mid, None)
         self._venting_start_time.pop(mid, None)
+        self._venting_seen.pop(mid, None)
+        self._job_orders.pop(mid, None)
 
         production_order_ids: list[str] = []
         if self._db is not None:
             try:
                 from src.db import get_production_orders, set_ended_at
                 production_order_ids = await get_production_orders(
-                    self._db, state.machine_id, state.order_part_program
+                    self._db, state.machine_id, order_part_program
                 )
-                await set_ended_at(self._db, state.machine_id, state.order_part_program, timing_data)
+                await set_ended_at(self._db, state.machine_id, order_part_program, timing_data)
             except Exception as exc:
                 self._append_log(
                     f"DB_ERR | machine={state.machine_id} | {type(exc).__name__}: {exc}"
@@ -298,7 +328,7 @@ class VentingMonitor:
             "event": "optotech_end_of_work",
             "timestamp": ts,
             "machine_id": state.machine_id,
-            "order_part_program": state.order_part_program,
+            "order_part_program": order_part_program,
             "production_order_ids": production_order_ids,
             "timing_data": timing_data,
         }
@@ -326,7 +356,7 @@ class VentingMonitor:
         timing_str = _format_timing(timing_data)
         await self._notify_slack(
             f"*Fine lavoro Optotech* | `{state.machine_id}`\n"
-            f"Programma: `{state.order_part_program}`\n"
+            f"Programma: `{order_part_program}`\n"
             f"Ordini: {orders_str}{timing_str}",
             machine_id=state.machine_id,
         )
@@ -338,16 +368,25 @@ class VentingMonitor:
             if timing_data else ""
         )
         await self._notify_email(
-            subject=f"Fine lavoro Optotech | {state.machine_id} | {state.order_part_program}",
+            subject=f"Fine lavoro Optotech | {state.machine_id} | {order_part_program}",
             body=(
                 f"Fine lavoro rilevata su macchina Optotech.\n\n"
                 f"Macchina: {state.machine_id}\n"
-                f"Programma: {state.order_part_program}\n"
+                f"Programma: {order_part_program}\n"
                 f"Ordini di produzione: {orders_str}\n"
                 f"{email_timing}"
             ),
             machine_id=state.machine_id,
         )
+
+    def _resolve_job_order(self, mid: str, fallback: str) -> str:
+        """order_part_program più frequente osservato durante il job (robusto alla
+        corruzione intermittente delle stringhe DB10). Fallback al valore corrente
+        se non c'è storico (es. monitor avviato a job già in corso)."""
+        counter = self._job_orders.get(mid)
+        if counter:
+            return counter.most_common(1)[0][0]
+        return fallback
 
     async def _notify_slack(self, text: str, machine_id: str = "") -> None:
         if not self._slack_webhook_url:
