@@ -75,6 +75,7 @@ class BuhlerVentingMonitor:
         self._prev_step_number: dict[str, object] = {}
         self._prev_running: dict[str, bool] = {}
         self._job_start_time: dict[str, datetime] = {}
+        self._first_real_step_seen: set[str] = set()
         self._first_phase_end_time: dict[str, datetime] = {}
         self._venting_start_time: dict[str, datetime] = {}
         self._pending_last_step: dict[str, str] = {}
@@ -257,6 +258,7 @@ class BuhlerVentingMonitor:
         # Avvio macchina (o prima osservazione come attiva)
         if state.process_start and not prev_running and not glitch_resume:
             self._job_start_time[mid] = now
+            self._first_real_step_seen.discard(mid)
             self._first_phase_end_time.pop(mid, None)
             self._venting_start_time.pop(mid, None)
             self._pending_last_step.pop(mid, None)
@@ -281,7 +283,13 @@ class BuhlerVentingMonitor:
             )
             # Traccia fine prima fase e inizio venting (solo dopo aver visto almeno uno step precedente)
             if prev_step_name is not None:
-                if mid not in self._first_phase_end_time:
+                if mid not in self._first_real_step_seen:
+                    # Primo cambio step dopo l'avvio: lo step precedente era quello
+                    # idle (catturato al fronte process_start 0→1). Questo cambio
+                    # segna il vero inizio della 1ª fase di produzione.
+                    self._first_real_step_seen.add(mid)
+                    self._job_start_time[mid] = now
+                elif mid not in self._first_phase_end_time:
                     self._first_phase_end_time[mid] = now
                 if state.step_name == "Venting":
                     if mid not in self._venting_start_time:

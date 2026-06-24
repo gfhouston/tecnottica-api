@@ -117,6 +117,7 @@ class BuhlerSubscriptionMonitor:
         self._prev_step_number: dict[str, object] = {}
         self._prev_running: dict[str, bool] = {}
         self._job_start_time: dict[str, datetime] = {}
+        self._first_real_step_seen: set[str] = set()
         self._first_phase_end_time: dict[str, datetime] = {}
         self._venting_start_time: dict[str, datetime] = {}
 
@@ -321,6 +322,7 @@ class BuhlerSubscriptionMonitor:
 
             if not glitch_resume:
                 self._job_start_time[mid] = now
+                self._first_real_step_seen.discard(mid)
                 self._first_phase_end_time.pop(mid, None)
                 self._venting_start_time.pop(mid, None)
                 self._pending_last_step.pop(mid, None)
@@ -350,7 +352,13 @@ class BuhlerSubscriptionMonitor:
                 f"PHASE_CHANGE | machine={mid} | step={state.step_name!r}"
                 f" | process_start={state.process_start}"
             )
-            if mid not in self._first_phase_end_time:
+            if mid not in self._first_real_step_seen:
+                # Primo cambio step dopo l'avvio: lo step precedente era quello
+                # idle (catturato al fronte process_start 0→1). Questo cambio
+                # segna il vero inizio della 1ª fase di produzione.
+                self._first_real_step_seen.add(mid)
+                self._job_start_time[mid] = now
+            elif mid not in self._first_phase_end_time:
                 self._first_phase_end_time[mid] = now
 
         # ── Ingresso in Venting (solo tempi / last_step, NON è un gate) ────
